@@ -488,6 +488,36 @@ def _difference_mask(source_ink: np.ndarray, reference_ink: np.ndarray, toleranc
     return np.where((source_ink > 0) & (distance > tolerance_px), 255, 0).astype(np.uint8)
 
 
+def _dilate_binary_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
+    """Dilate a zero/255 mask with OpenCV's rectangular-kernel semantics.
+
+    A summed-area table answers whether each kernel-sized neighborhood contains
+    ink in constant time. The asymmetric padding preserves OpenCV's default
+    center anchor for even kernels: a 20-pixel kernel examines offsets -10..9
+    from each output pixel, so a source pixel expands 9 pixels up/left and 10
+    pixels down/right. Out-of-bounds pixels remain background.
+    """
+    anchor = kernel_size // 2
+    padded = np.pad(
+        mask > 0,
+        ((anchor, kernel_size - anchor - 1), (anchor, kernel_size - anchor - 1)),
+        constant_values=False,
+    )
+    integral = np.zeros((padded.shape[0] + 1, padded.shape[1] + 1), dtype=np.uint32)
+    integral[1:, 1:] = np.cumsum(
+        np.cumsum(padded, axis=0, dtype=np.uint32),
+        axis=1,
+        dtype=np.uint32,
+    )
+    window_sums = (
+        integral[kernel_size:, kernel_size:]
+        - integral[:-kernel_size, kernel_size:]
+        - integral[kernel_size:, :-kernel_size]
+        + integral[:-kernel_size, :-kernel_size]
+    )
+    return np.where(window_sums > 0, 255, 0).astype(np.uint8)
+
+
 def _regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distance: int) -> list[DifferenceRegion]:
     """Group nearby ink changes into reviewable regions without inflating area.
 
@@ -499,10 +529,7 @@ def _regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distance: int
     if not np.any(mask):
         return []
     if merge_distance:
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT, (merge_distance, merge_distance)
-        )
-        grouped = cv2.dilate(mask, kernel, iterations=1)
+        grouped = _dilate_binary_mask(mask, merge_distance)
     else:
         grouped = mask
     count, labels = cv2.connectedComponents(grouped, connectivity=8)
