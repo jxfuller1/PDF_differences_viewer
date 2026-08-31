@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+.venv/
+venv/
+dist/
+build/
+*.spec
+*.log
+
+# User-selected drawings and locally generated comparison exports
+*.pdf
+comparison-output/

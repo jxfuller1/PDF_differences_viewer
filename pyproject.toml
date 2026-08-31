@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pdf-differences-viewer"
+version = "0.1.0"
+description = "A native PyQt6 QGraphicsView desktop application for reviewing differences between PDF drawings."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "jxfuller1" },
+]
+dependencies = [
+  "numpy>=1.24",
+  "opencv-python>=4.8",
+  "PyMuPDF>=1.23",
+  "PyQt6>=6.6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+pdf-differences-viewer = "pdf_differences_viewer.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pdf_differences_viewer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
