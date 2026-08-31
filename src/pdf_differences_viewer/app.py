@@ -37,8 +37,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .engine import ComparisonResult, DifferenceRegion, compare_pdf_pages
-from .graphics import ComparisonGraphicsWidget
+from engine import ComparisonResult, DifferenceRegion, compare_pdf_pages
+from graphics import ComparisonGraphicsWidget
 
 
 class ComparisonWorker(QThread):
@@ -447,41 +447,11 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def _apply_style(application: QApplication) -> None:
-    application.setStyle("Fusion")
-    palette = application.palette()
-    palette.setColor(QPalette.ColorRole.Window, QColor("#f4f6f9"))
-    palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
-    palette.setColor(QPalette.ColorRole.Text, QColor("#17212e"))
-    application.setPalette(palette)
-    application.setStyleSheet(
-        """
-        QMainWindow, QWidget#root { background: #f4f6f9; color: #17212e; }
-        QFrame#fileControls, QFrame#reviewControls, QFrame#changePanel {
-            background: #ffffff; border: 1px solid #d9e0e8; border-radius: 8px;
-        }
-        QLabel#fieldLabel { color: #4d6074; font-weight: 600; }
-        QLabel#panelHeading { font-size: 16px; font-weight: 700; }
-        QLabel#changeSummary { color: #53667b; }
-        QLabel#alignmentNote { color: #718299; font-size: 11px; }
-        QLineEdit, QComboBox, QSpinBox { min-height: 27px; border: 1px solid #c8d3df; border-radius: 5px; padding: 0 7px; background: #ffffff; }
-        QPushButton { min-height: 28px; border: 1px solid #b9c7d5; border-radius: 5px; background: #f8fafc; padding: 0 10px; }
-        QPushButton:hover { background: #eef4fb; border-color: #82a7d2; }
-        QPushButton#compareButton { background: #1769aa; border-color: #1769aa; color: white; font-weight: 700; padding: 0 16px; }
-        QPushButton#compareButton:hover { background: #125789; }
-        QTreeWidget#changeTree { border: 1px solid #e0e6ed; border-radius: 5px; outline: none; }
-        QTreeWidget#changeTree::item { padding: 7px 5px; border-bottom: 1px solid #edf1f5; }
-        QTreeWidget#changeTree::item:selected { background: #e8f1fb; }
-        QGraphicsView { border: 1px solid #d9e0e8; border-radius: 8px; background: #e6eaf0; }
-        QProgressBar { border: 1px solid #c8d3df; border-radius: 5px; text-align: center; background: #ffffff; }
-        QProgressBar::chunk { background: #287abd; border-radius: 4px; }
-        """
-    )
+
 
 
 def main(argv: list[str] | None = None) -> int:
     application = QApplication(argv if argv is not None else sys.argv)
-    _apply_style(application)
     window = MainWindow()
     window.show()
     return application.exec()
