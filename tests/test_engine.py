@@ -198,6 +198,19 @@ def test_binary_mask_dilation_matches_opencv_rectangular_kernels() -> None:
         np.testing.assert_array_equal(_dilate_binary_mask(mask, kernel_size), expected)
 
 
+def test_sparse_binary_mask_dilation_matches_opencv_at_page_edges() -> None:
+    mask = np.zeros((23, 31), dtype=np.uint8)
+    mask[0, 0] = mask[-1, -1] = 255
+
+    for kernel_size in (2, 3, 20):
+        expected = cv2.dilate(
+            mask,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size)),
+            iterations=1,
+        )
+        np.testing.assert_array_equal(_dilate_binary_mask(mask, kernel_size), expected)
+
+
 def _write_pdf(path, *, add_circle: bool) -> None:
     document = fitz.open()
     page = document.new_page(width=240, height=180)

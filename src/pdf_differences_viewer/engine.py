@@ -17,8 +17,8 @@ import cv2
 import pymupdf as fitz
 import numpy as np
 from PIL import Image
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QImage, QPainter, QTransform
+from PyQt6.QtCore import QRect, Qt
+from PyQt6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QTransform
 
 from colors import DifferenceColors
 
@@ -39,6 +39,12 @@ class AffineWarpSettings:
     QT_MAX_ROTATION_DEGREES = 0.0001
     GRAY_GUARD_BAND = 32
     MAX_GUARDED_PIXEL_FRACTION = 0.25
+
+
+class MaskDilationSettings:
+    """Tuning values for grouped sparse change masks."""
+
+    QT_MAX_FOREGROUND_FRACTION = 0.005
 
 
 @dataclass(frozen=True)
@@ -491,12 +497,49 @@ def _difference_mask(source_ink: np.ndarray, reference_ink: np.ndarray, toleranc
 def _dilate_binary_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
     """Dilate a zero/255 mask with OpenCV's rectangular-kernel semantics.
 
-    A summed-area table answers whether each kernel-sized neighborhood contains
-    ink in constant time. The asymmetric padding preserves OpenCV's default
-    center anchor for even kernels: a 20-pixel kernel examines offsets -10..9
-    from each output pixel, so a source pixel expands 9 pixels up/left and 10
-    pixels down/right. Out-of-bounds pixels remain background.
+    Sparse masks use Qt's native raster painter to fill the kernel rectangle at
+    each ink pixel. Dense masks use a summed-area table instead. Both preserve
+    OpenCV's default center anchor for even kernels: a 20-pixel kernel examines
+    offsets -10..9 from each output pixel, so a source pixel expands 9 pixels
+    up/left and 10 pixels down/right. Out-of-bounds pixels remain background.
     """
+    if kernel_size == 1:
+        return mask.copy()
+    foreground_count = int(np.count_nonzero(mask))
+    if foreground_count <= mask.size * MaskDilationSettings.QT_MAX_FOREGROUND_FRACTION:
+        try:
+            return _dilate_sparse_binary_mask_qt(mask, kernel_size)
+        except (RuntimeError, TypeError, ValueError):
+            pass
+    return _dilate_binary_mask_integral(mask, kernel_size)
+
+
+def _dilate_sparse_binary_mask_qt(mask: np.ndarray, kernel_size: int) -> np.ndarray:
+    """Draw every sparse binary-mask dilation rectangle in Qt's raster engine."""
+    height, width = mask.shape
+    anchor = kernel_size // 2
+    leading_extent = kernel_size - anchor - 1
+    ys, xs = np.nonzero(mask)
+    output_image = QImage(width, height, QImage.Format.Format_Grayscale8)
+    output_image.fill(0)
+    rectangles = [
+        QRect(int(x - leading_extent), int(y - leading_extent), kernel_size, kernel_size)
+        for y, x in zip(ys, xs)
+    ]
+    painter = QPainter(output_image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+    painter.setPen(QPen(Qt.PenStyle.NoPen))
+    painter.setBrush(QBrush(QColor(255, 255, 255)))
+    painter.drawRects(rectangles)
+    painter.end()
+
+    bits = output_image.bits()
+    bits.setsize(output_image.sizeInBytes())
+    return np.frombuffer(bits, dtype=np.uint8).reshape(height, output_image.bytesPerLine())[:, :width].copy()
+
+
+def _dilate_binary_mask_integral(mask: np.ndarray, kernel_size: int) -> np.ndarray:
+    """Dilate a dense binary mask through a NumPy summed-area table."""
     anchor = kernel_size // 2
     padded = np.pad(
         mask > 0,
