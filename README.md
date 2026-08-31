@@ -12,10 +12,10 @@ embedded browser, local web server, or browser profile.
 - Opens an old and a new PDF, with a selectable page in each document.
 - Rasterizes and aligns the old drawing to the new one before calculating the
   difference, which reduces false positives caused by small page shifts.
-- Displays the old drawing, new drawing, red additions, and blue removals as
+- Displays the old drawing, new drawing, bright-blue additions, and bright-red removals as
   independent `QGraphicsPixmapItem` layers.
 - Provides a smooth old-to-new review slider, independent addition/removal
-  toggles, pan and wheel zoom, fit/reset controls, and a clickable change list.
+  toggles, Ctrl-wheel zoom, fit/reset controls, and a clickable change list.
 - Keeps all image processing local. It does not upload drawings or require an
   API key.
 
@@ -42,16 +42,22 @@ python -m pdf_differences_viewer
 
 | Control | Action |
 | --- | --- |
-| Mouse wheel | Zoom around the cursor |
-| Left-drag | Pan the drawing |
+| `Ctrl` + mouse wheel | Zoom around the cursor |
+| Mouse wheel | Scroll the drawing without changing zoom |
 | Click a change | Select it in the change list |
 | Double-click a change | Zoom to that change |
 | `F` / Fit | Fit the drawing to the viewer |
 | `0` / Reset | Return to a 1:1 zoom |
 
-The blend slider starts on the old drawing and ends on the new drawing. Red and
-blue difference layers are strongest in the middle, so the endpoints remain
+The blend slider starts on the old drawing and ends on the new drawing. Blue
+additions and red removals are strongest in the middle, so the endpoints remain
 clean for direct revision review.
+
+Change boxes pulse slowly to make them easy to find. To tune the speed, adjust
+`CHANGE_BOX_PULSE_PERIOD_MS` near the top of
+`src/pdf_differences_viewer/graphics.py` (the default is 2,000 milliseconds).
+Their translucent interiors use the same blue or red as the corresponding
+difference type, and the pointer becomes a hand when it is over a box.
 
 ## Development
 
@@ -68,14 +74,14 @@ The application deliberately uses Qt's scene graph rather than HTML:
 PDFs → OpenCV comparison → QGraphicsScene
                            ├── old drawing pixmap
                            ├── new drawing pixmap
-                           ├── red additions pixmap
-                           ├── blue removals pixmap
+                           ├── bright-blue additions pixmap
+                           ├── bright-red removals pixmap
                            └── interactive region overlays
 ```
 
 The `QGraphicsView` approach lets Qt composite the layers directly, preserves
-high-quality pixmap rendering at arbitrary zoom levels, and makes region
-selection/panning native Qt interactions.
+high-quality pixmap rendering at arbitrary zoom levels and makes region
+selection native Qt interactions.
 
 ## Attribution
 

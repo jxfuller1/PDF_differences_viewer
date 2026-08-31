@@ -5,6 +5,7 @@ import pymupdf as fitz
 import numpy as np
 
 from pdf_differences_viewer.engine import compare_page_images, compare_pdf_pages, render_pdf_page
+from pdf_differences_viewer.colors import ADDITION_BGR, REMOVAL_BGR
 
 
 def _blank(height: int = 180, width: int = 240) -> np.ndarray:
@@ -35,9 +36,9 @@ def test_new_and_removed_ink_become_colored_layers() -> None:
     assert result.removed_pixels > 0
     assert result.added_regions
     assert result.removed_regions
-    # OpenCV BGRA: additions are red and removals are blue.
-    assert np.any(np.all(result.added_layer[:, :, :3] == (0, 0, 255), axis=2))
-    assert np.any(np.all(result.removed_layer[:, :, :3] == (255, 0, 0), axis=2))
+    # OpenCV BGRA: additions are bright blue and removals are bright red.
+    assert np.any(np.all(result.added_layer[:, :, :3] == ADDITION_BGR, axis=2))
+    assert np.any(np.all(result.removed_layer[:, :, :3] == REMOVAL_BGR, axis=2))
 
 
 def test_old_page_is_resized_to_new_page_dimensions() -> None:

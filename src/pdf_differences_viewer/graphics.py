@@ -2,18 +2,32 @@
 
 The module intentionally contains no QtWebEngine dependency.  Images supplied by
 ``engine.ComparisonResult`` are painted as pixmaps in a QGraphicsScene, making
-zooming and panning inexpensive even for large rendered pages.
+zooming and reviewing inexpensive even for large rendered pages.
 """
 
 from __future__ import annotations
 
 import math
+import time
 from typing import Any
 
 import numpy as np
 from PyQt6.QtCore import QPointF, QRectF, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene, QGraphicsView, QWidget
+
+from .colors import ADDITION_RGB, REMOVAL_RGB
+
+
+# Change this value to fine-tune how slowly the change rectangles pulse.
+CHANGE_BOX_PULSE_PERIOD_MS = 2_000
+CHANGE_BOX_PULSE_FRAME_INTERVAL_MS = 33
+CHANGE_BOX_MIN_FILL_ALPHA = 18
+CHANGE_BOX_MAX_FILL_ALPHA = 82
+CHANGE_BOX_MIN_OUTLINE_ALPHA = 145
+CHANGE_BOX_MAX_OUTLINE_ALPHA = 255
+CHANGE_BOX_MIN_PEN_WIDTH = 1.5
+CHANGE_BOX_MAX_PEN_WIDTH = 3.25
 
 
 def bgra_to_pixmap(array: np.ndarray) -> QPixmap:
@@ -31,7 +45,7 @@ def bgra_to_pixmap(array: np.ndarray) -> QPixmap:
 
 
 class DifferenceGraphicsView(QGraphicsView):
-    """Graphics view with anchored wheel zoom, middle/left drag panning and fit keys."""
+    """Graphics view with Ctrl-wheel zoom, scroll-wheel navigation, and fit keys."""
 
     item_clicked = pyqtSignal(str)
     item_double_clicked = pyqtSignal(str)
@@ -39,7 +53,8 @@ class DifferenceGraphicsView(QGraphicsView):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
-        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
@@ -48,6 +63,9 @@ class DifferenceGraphicsView(QGraphicsView):
         self._dragging = False
 
     def wheelEvent(self, event: Any) -> None:
+        if not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            super().wheelEvent(event)
+            return
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         next_scale = self.transform().m11() * factor
         if not 0.02 <= next_scale <= 100:
@@ -115,10 +133,15 @@ class ComparisonGraphicsWidget(QWidget):
         layout.addWidget(self.view)
         self._result = None
         self._items: dict[str, QGraphicsRectItem] = {}
+        self._box_colors: dict[str, QColor] = {}
         self._layers: dict[str, QGraphicsPixmapItem] = {}
         self._blend = 50
         self._toggles = {"added": True, "removed": True, "annotations": True, "moved": True}
         self._fit_pending = False
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.setInterval(CHANGE_BOX_PULSE_FRAME_INTERVAL_MS)
+        self._pulse_timer.timeout.connect(self._update_box_pulse)
+        self._pulse_started_at = time.monotonic()
         self.view.item_clicked.connect(self._on_click)
         self.view.item_double_clicked.connect(self._on_double_click)
 
@@ -128,7 +151,8 @@ class ComparisonGraphicsWidget(QWidget):
 
     def set_result(self, result: Any | None) -> None:
         self._result = result
-        self.scene.clear(); self._items.clear(); self._layers.clear()
+        self._pulse_timer.stop()
+        self.scene.clear(); self._items.clear(); self._box_colors.clear(); self._layers.clear()
         if result is None:
             return
         for z_value, (name, image) in enumerate((("old", result.old_bgra), ("new", result.new_bgra), ("added", result.added_layer), ("removed", result.removed_layer))):
@@ -139,9 +163,14 @@ class ComparisonGraphicsWidget(QWidget):
             for index, region in enumerate(regions):
                 x, y, w, h = region.bbox; ident = f"{kind}:{index}"
                 rect = QGraphicsRectItem(QRectF(x, y, w, h)); rect.setData(0, ident); rect.setZValue(10)
-                color = QColor(220, 40, 40) if kind == "added" else QColor(40, 90, 220)
-                rect.setPen(QPen(color, 2)); rect.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), 22)))
-                rect.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable, True); self.scene.addItem(rect); self._items[ident] = rect
+                color = QColor(*ADDITION_RGB) if kind == "added" else QColor(*REMOVAL_RGB)
+                rect.setAcceptHoverEvents(True)
+                rect.setCursor(Qt.CursorShape.PointingHandCursor)
+                rect.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable, True)
+                self.scene.addItem(rect)
+                self._items[ident] = rect
+                self._box_colors[ident] = color
+        self._pulse_started_at = time.monotonic()
         self._apply_state(); self._request_initial_fit()
 
     def set_blend(self, value: int) -> None:
@@ -163,6 +192,7 @@ class ComparisonGraphicsWidget(QWidget):
         for ident, item in self._items.items():
             kind = ident.split(":", 1)[0]
             item.setVisible(self._toggles["annotations"] and self._toggles[kind])
+        self._refresh_pulse_timer()
 
     def _set_toggle(self, name: str, enabled: bool) -> None:
         self._toggles[name] = bool(enabled); self._apply_state()
@@ -200,6 +230,36 @@ class ComparisonGraphicsWidget(QWidget):
     def _select_region_item(self, ident: str) -> None:
         self.scene.clearSelection()
         self._items[ident].setSelected(True)
+
+    def _refresh_pulse_timer(self) -> None:
+        """Run the animation only while at least one change box is visible."""
+        if any(item.isVisible() for item in self._items.values()):
+            if not self._pulse_timer.isActive():
+                self._pulse_started_at = time.monotonic()
+                self._pulse_timer.start()
+            self._update_box_pulse()
+        else:
+            self._pulse_timer.stop()
+
+    def _update_box_pulse(self) -> None:
+        """Apply one slow, translucent pulse to every visible change box."""
+        if not any(item.isVisible() for item in self._items.values()):
+            self._pulse_timer.stop()
+            return
+        elapsed_ms = (time.monotonic() - self._pulse_started_at) * 1000
+        period_ms = max(1, CHANGE_BOX_PULSE_PERIOD_MS)
+        phase = (elapsed_ms % period_ms) / period_ms
+        # Start at the subtle end of the pulse, smoothly swell, then recede.
+        strength = (math.sin(math.tau * phase - math.pi / 2) + 1.0) / 2.0
+        fill_alpha = round(CHANGE_BOX_MIN_FILL_ALPHA + strength * (CHANGE_BOX_MAX_FILL_ALPHA - CHANGE_BOX_MIN_FILL_ALPHA))
+        outline_alpha = round(CHANGE_BOX_MIN_OUTLINE_ALPHA + strength * (CHANGE_BOX_MAX_OUTLINE_ALPHA - CHANGE_BOX_MIN_OUTLINE_ALPHA))
+        pen_width = CHANGE_BOX_MIN_PEN_WIDTH + strength * (CHANGE_BOX_MAX_PEN_WIDTH - CHANGE_BOX_MIN_PEN_WIDTH)
+        for ident, item in self._items.items():
+            color = self._box_colors[ident]
+            pen = QPen(QColor(color.red(), color.green(), color.blue(), outline_alpha), pen_width)
+            pen.setCosmetic(True)
+            item.setPen(pen)
+            item.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), fill_alpha)))
 
     def _request_initial_fit(self) -> None:
         """Fit once after the widget receives a usable viewport size.
