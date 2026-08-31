@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .colors import ADDITION_RGB, REMOVAL_RGB
+from .colors import DifferenceColors
 from .engine import ComparisonResult, DifferenceRegion, compare_pdf_pages
 from .graphics import ComparisonGraphicsWidget
 
@@ -146,7 +146,7 @@ class ChangeList(QFrame):
             item = QTreeWidgetItem([self._region_label(region)])
             item.setData(0, Qt.ItemDataRole.UserRole, ident)
             item.setToolTip(0, "Click to locate this region; double-click to zoom to it.")
-            color = QColor(*ADDITION_RGB) if region.kind == "added" else QColor(*REMOVAL_RGB)
+            color = QColor(*DifferenceColors.ADDITION_RGB) if region.kind == "added" else QColor(*DifferenceColors.REMOVAL_RGB)
             item.setForeground(0, color)
             self.tree.addTopLevelItem(item)
 

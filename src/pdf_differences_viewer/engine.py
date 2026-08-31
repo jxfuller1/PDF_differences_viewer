@@ -16,7 +16,7 @@ import cv2
 import pymupdf as fitz
 import numpy as np
 
-from .colors import ADDITION_BGR, REMOVAL_BGR
+from .colors import DifferenceColors
 
 
 ProgressCallback = Callable[[str, float], None]
@@ -272,8 +272,8 @@ def compare_page_images(
     removed_regions = _regions(removed_mask, "removed", minimum_region_area, region_merge_distance)
     # Layers are BGRA here, matching OpenCV/QImage byte order on Windows.
     # Added ink is bright blue; removed ink is bright red.
-    added_layer = _layer(added_mask, ADDITION_BGR, overlay_alpha)
-    removed_layer = _layer(removed_mask, REMOVAL_BGR, overlay_alpha)
+    added_layer = _layer(added_mask, DifferenceColors.ADDITION_BGR, overlay_alpha)
+    removed_layer = _layer(removed_mask, DifferenceColors.REMOVAL_BGR, overlay_alpha)
     old_bgra, new_bgra = cv2.cvtColor(old_aligned, cv2.COLOR_BGR2BGRA), cv2.cvtColor(new_bgr, cv2.COLOR_BGR2BGRA)
     added_pixels, removed_pixels = int(np.count_nonzero(added_mask)), int(np.count_nonzero(removed_mask))
     _progress(progress, "comparison complete", 1.0)

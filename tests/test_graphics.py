@@ -8,14 +8,10 @@ from PyQt6.QtCore import QPoint, QPointF, Qt
 from PyQt6.QtGui import QWheelEvent
 from PyQt6.QtWidgets import QGraphicsView
 
-from pdf_differences_viewer.colors import ADDITION_RGB
+from pdf_differences_viewer.colors import DifferenceColors
 from pdf_differences_viewer.engine import compare_page_images
 from pdf_differences_viewer.graphics import (
-    CHANGE_BOX_MAX_FILL_ALPHA,
-    CHANGE_BOX_MAX_OUTLINE_ALPHA,
-    CHANGE_BOX_MIN_FILL_ALPHA,
-    CHANGE_BOX_MIN_OUTLINE_ALPHA,
-    CHANGE_BOX_PULSE_PERIOD_MS,
+    ChangeBoxPulseSettings,
     ComparisonGraphicsWidget,
 )
 
@@ -78,17 +74,17 @@ def test_change_boxes_pulse_in_semantic_color_and_use_hand_cursor(qapp) -> None:
 
     # The first frame starts subtle. The fill remains translucent so the page
     # beneath the annotation stays readable.
-    assert box.pen().color().getRgb()[:3] == ADDITION_RGB
-    assert CHANGE_BOX_MIN_OUTLINE_ALPHA <= box.pen().color().alpha() <= CHANGE_BOX_MAX_OUTLINE_ALPHA
-    assert CHANGE_BOX_MIN_FILL_ALPHA <= box.brush().color().alpha() <= CHANGE_BOX_MAX_FILL_ALPHA
+    assert box.pen().color().getRgb()[:3] == DifferenceColors.ADDITION_RGB
+    assert ChangeBoxPulseSettings.MIN_OUTLINE_ALPHA <= box.pen().color().alpha() <= ChangeBoxPulseSettings.MAX_OUTLINE_ALPHA
+    assert ChangeBoxPulseSettings.MIN_FILL_ALPHA <= box.brush().color().alpha() <= ChangeBoxPulseSettings.MAX_FILL_ALPHA
     assert box.brush().color().alpha() < 255
 
     # Move precisely to the pulse peak to prove the tunable animation changes
     # both the outline and translucent interior.
-    viewer._pulse_started_at = time.monotonic() - CHANGE_BOX_PULSE_PERIOD_MS / 2_000
+    viewer._pulse_started_at = time.monotonic() - ChangeBoxPulseSettings.PERIOD_MS / 2_000
     viewer._update_box_pulse()
-    assert box.pen().color().alpha() == CHANGE_BOX_MAX_OUTLINE_ALPHA
-    assert box.brush().color().alpha() == CHANGE_BOX_MAX_FILL_ALPHA
+    assert box.pen().color().alpha() == ChangeBoxPulseSettings.MAX_OUTLINE_ALPHA
+    assert box.brush().color().alpha() == ChangeBoxPulseSettings.MAX_FILL_ALPHA
 
 
 def test_zoom_requires_control_and_view_never_uses_pan_hand_drag(qapp) -> None:

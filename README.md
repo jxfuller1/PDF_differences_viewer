@@ -54,7 +54,7 @@ additions and red removals are strongest in the middle, so the endpoints remain
 clean for direct revision review.
 
 Change boxes pulse slowly to make them easy to find. To tune the speed, adjust
-`CHANGE_BOX_PULSE_PERIOD_MS` near the top of
+`ChangeBoxPulseSettings.PERIOD_MS` near the top of
 `src/pdf_differences_viewer/graphics.py` (the default is 2,000 milliseconds).
 Their translucent interiors use the same blue or red as the corresponding
 difference type, and the pointer becomes a hand when it is over a box.

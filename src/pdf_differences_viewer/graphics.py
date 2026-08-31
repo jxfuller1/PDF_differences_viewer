@@ -16,18 +16,24 @@ from PyQt6.QtCore import QPointF, QRectF, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene, QGraphicsView, QWidget
 
-from .colors import ADDITION_RGB, REMOVAL_RGB
+from .colors import DifferenceColors
 
 
-# Change this value to fine-tune how slowly the change rectangles pulse.
-CHANGE_BOX_PULSE_PERIOD_MS = 2_000
-CHANGE_BOX_PULSE_FRAME_INTERVAL_MS = 33
-CHANGE_BOX_MIN_FILL_ALPHA = 18
-CHANGE_BOX_MAX_FILL_ALPHA = 82
-CHANGE_BOX_MIN_OUTLINE_ALPHA = 145
-CHANGE_BOX_MAX_OUTLINE_ALPHA = 255
-CHANGE_BOX_MIN_PEN_WIDTH = 1.5
-CHANGE_BOX_MAX_PEN_WIDTH = 3.25
+class ChangeBoxPulseSettings:
+    """Tunable animation settings for the pulsing change rectangles.
+
+    Increase ``PERIOD_MS`` for a slower pulse or decrease it for a faster one.
+    ``FRAME_INTERVAL_MS`` controls how often the animation is redrawn.
+    """
+
+    PERIOD_MS = 2_000
+    FRAME_INTERVAL_MS = 33
+    MIN_FILL_ALPHA = 18
+    MAX_FILL_ALPHA = 82
+    MIN_OUTLINE_ALPHA = 145
+    MAX_OUTLINE_ALPHA = 255
+    MIN_PEN_WIDTH = 1.5
+    MAX_PEN_WIDTH = 3.25
 
 
 def bgra_to_pixmap(array: np.ndarray) -> QPixmap:
@@ -139,7 +145,7 @@ class ComparisonGraphicsWidget(QWidget):
         self._toggles = {"added": True, "removed": True, "annotations": True, "moved": True}
         self._fit_pending = False
         self._pulse_timer = QTimer(self)
-        self._pulse_timer.setInterval(CHANGE_BOX_PULSE_FRAME_INTERVAL_MS)
+        self._pulse_timer.setInterval(ChangeBoxPulseSettings.FRAME_INTERVAL_MS)
         self._pulse_timer.timeout.connect(self._update_box_pulse)
         self._pulse_started_at = time.monotonic()
         self.view.item_clicked.connect(self._on_click)
@@ -163,7 +169,7 @@ class ComparisonGraphicsWidget(QWidget):
             for index, region in enumerate(regions):
                 x, y, w, h = region.bbox; ident = f"{kind}:{index}"
                 rect = QGraphicsRectItem(QRectF(x, y, w, h)); rect.setData(0, ident); rect.setZValue(10)
-                color = QColor(*ADDITION_RGB) if kind == "added" else QColor(*REMOVAL_RGB)
+                color = QColor(*DifferenceColors.ADDITION_RGB) if kind == "added" else QColor(*DifferenceColors.REMOVAL_RGB)
                 rect.setAcceptHoverEvents(True)
                 rect.setCursor(Qt.CursorShape.PointingHandCursor)
                 rect.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable, True)
@@ -247,13 +253,22 @@ class ComparisonGraphicsWidget(QWidget):
             self._pulse_timer.stop()
             return
         elapsed_ms = (time.monotonic() - self._pulse_started_at) * 1000
-        period_ms = max(1, CHANGE_BOX_PULSE_PERIOD_MS)
+        period_ms = max(1, ChangeBoxPulseSettings.PERIOD_MS)
         phase = (elapsed_ms % period_ms) / period_ms
         # Start at the subtle end of the pulse, smoothly swell, then recede.
         strength = (math.sin(math.tau * phase - math.pi / 2) + 1.0) / 2.0
-        fill_alpha = round(CHANGE_BOX_MIN_FILL_ALPHA + strength * (CHANGE_BOX_MAX_FILL_ALPHA - CHANGE_BOX_MIN_FILL_ALPHA))
-        outline_alpha = round(CHANGE_BOX_MIN_OUTLINE_ALPHA + strength * (CHANGE_BOX_MAX_OUTLINE_ALPHA - CHANGE_BOX_MIN_OUTLINE_ALPHA))
-        pen_width = CHANGE_BOX_MIN_PEN_WIDTH + strength * (CHANGE_BOX_MAX_PEN_WIDTH - CHANGE_BOX_MIN_PEN_WIDTH)
+        fill_alpha = round(
+            ChangeBoxPulseSettings.MIN_FILL_ALPHA
+            + strength * (ChangeBoxPulseSettings.MAX_FILL_ALPHA - ChangeBoxPulseSettings.MIN_FILL_ALPHA)
+        )
+        outline_alpha = round(
+            ChangeBoxPulseSettings.MIN_OUTLINE_ALPHA
+            + strength * (ChangeBoxPulseSettings.MAX_OUTLINE_ALPHA - ChangeBoxPulseSettings.MIN_OUTLINE_ALPHA)
+        )
+        pen_width = (
+            ChangeBoxPulseSettings.MIN_PEN_WIDTH
+            + strength * (ChangeBoxPulseSettings.MAX_PEN_WIDTH - ChangeBoxPulseSettings.MIN_PEN_WIDTH)
+        )
         for ident, item in self._items.items():
             color = self._box_colors[ident]
             pen = QPen(QColor(color.red(), color.green(), color.blue(), outline_alpha), pen_width)
