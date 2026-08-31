@@ -37,9 +37,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .colors import DifferenceColors
-from .engine import ComparisonResult, DifferenceRegion, compare_pdf_pages
-from .graphics import ComparisonGraphicsWidget
+from colors import DifferenceColors
+from engine import ComparisonResult, DifferenceRegion, compare_pdf_pages
+from graphics import ComparisonGraphicsWidget
 
 
 class ComparisonWorker(QThread):
