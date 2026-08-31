@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import pymupdf as fitz
 from PyQt6.QtCore import QEventLoop, QTimer
+from PyQt6.QtGui import QPalette
 
-from pdf_differences_viewer.app import MainWindow
+from pdf_differences_viewer.app import MainWindow, _apply_style
 
 
 def test_main_window_uses_native_graphics_view(qapp) -> None:
@@ -12,6 +13,17 @@ def test_main_window_uses_native_graphics_view(qapp) -> None:
     assert window.windowTitle() == "PDF Differences Viewer"
     assert window.viewer.view.scene() is window.viewer.scene
     assert window.viewer.scene.sceneRect().isValid()
+
+
+def test_light_style_overrides_dark_system_control_colors(qapp) -> None:
+    _apply_style(qapp)
+    palette = qapp.palette()
+
+    assert palette.color(QPalette.ColorRole.Button).name() == "#f8fafc"
+    assert palette.color(QPalette.ColorRole.ButtonText).name() == "#17212e"
+    assert palette.color(QPalette.ColorRole.WindowText).name() == "#17212e"
+    assert palette.color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText).name() == "#8a98a8"
+    assert "QComboBox::drop-down" in qapp.styleSheet()
 
 
 def _write_pdf(path, circle: bool) -> None:

@@ -448,11 +448,28 @@ class MainWindow(QMainWindow):
 
 
 def _apply_style(application: QApplication) -> None:
+    """Apply a complete light palette, including controls on dark Windows themes."""
     application.setStyle("Fusion")
     palette = application.palette()
     palette.setColor(QPalette.ColorRole.Window, QColor("#f4f6f9"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#17212e"))
     palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#f8fafc"))
     palette.setColor(QPalette.ColorRole.Text, QColor("#17212e"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#f8fafc"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#17212e"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#17212e"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#287abd"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Link, QColor("#1769aa"))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#718299"))
+    for role in (
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+        QPalette.ColorRole.ButtonText,
+    ):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#8a98a8"))
     application.setPalette(palette)
     application.setStyleSheet(
         """
@@ -464,11 +481,16 @@ def _apply_style(application: QApplication) -> None:
         QLabel#panelHeading { font-size: 16px; font-weight: 700; }
         QLabel#changeSummary { color: #53667b; }
         QLabel#alignmentNote { color: #718299; font-size: 11px; }
-        QLineEdit, QComboBox, QSpinBox { min-height: 27px; border: 1px solid #c8d3df; border-radius: 5px; padding: 0 7px; background: #ffffff; }
-        QPushButton { min-height: 28px; border: 1px solid #b9c7d5; border-radius: 5px; background: #f8fafc; padding: 0 10px; }
+        QLineEdit, QComboBox, QSpinBox { color: #17212e; min-height: 27px; border: 1px solid #c8d3df; border-radius: 5px; padding: 0 7px; background: #ffffff; selection-background-color: #287abd; selection-color: #ffffff; }
+        QComboBox QAbstractItemView { color: #17212e; background: #ffffff; selection-background-color: #287abd; selection-color: #ffffff; }
+        QComboBox::drop-down, QSpinBox::up-button, QSpinBox::down-button { background: #eef2f6; border: 1px solid #c8d3df; }
+        QComboBox::drop-down { width: 24px; border-top-right-radius: 4px; border-bottom-right-radius: 4px; }
+        QSpinBox::up-button, QSpinBox::down-button { width: 20px; }
+        QPushButton { color: #17212e; min-height: 28px; border: 1px solid #b9c7d5; border-radius: 5px; background: #f8fafc; padding: 0 10px; }
         QPushButton:hover { background: #eef4fb; border-color: #82a7d2; }
         QPushButton#compareButton { background: #1769aa; border-color: #1769aa; color: white; font-weight: 700; padding: 0 16px; }
         QPushButton#compareButton:hover { background: #125789; }
+        QCheckBox { color: #17212e; }
         QTreeWidget#changeTree { border: 1px solid #e0e6ed; border-radius: 5px; outline: none; }
         QTreeWidget#changeTree::item { padding: 7px 5px; border-bottom: 1px solid #edf1f5; }
         QTreeWidget#changeTree::item:selected { background: #e8f1fb; }
