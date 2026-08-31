@@ -8,10 +8,13 @@ from pdf_differences_viewer.colors import DifferenceColors
 from pdf_differences_viewer.engine import (
     _bgr_to_bgra,
     _bgr_to_gray,
+    _can_use_qt_affine_warp,
     _gray_to_bgr,
+    _ink_mask,
     _resize_bgr,
     _rgb_to_bgr,
     _warp_bgr_affine,
+    _warp_bgr_affine_numpy,
     compare_page_images,
     compare_pdf_pages,
     render_pdf_page,
@@ -58,6 +61,58 @@ def test_pillow_resize_and_numpy_affine_warp_preserve_bgr_geometry() -> None:
     warped = _warp_bgr_affine(source, matrix, 5, 5)
     np.testing.assert_array_equal(warped[2, 2], (0, 0, 0))
     assert np.count_nonzero(np.all(warped == 0, axis=2)) == 1
+
+
+def test_fast_qt_affine_path_preserves_the_numpy_ink_mask() -> None:
+    source = _blank(64, 64)
+    source[12:45, 20] = (0, 0, 0)
+    source[28, 24:48] = (244, 244, 244)
+    matrix = np.array([[1, 0, 0.003], [0, 1, -0.002]], dtype=np.float32)
+
+    assert _can_use_qt_affine_warp(matrix, ink_threshold=245)
+    accelerated = _warp_bgr_affine(source, matrix, 64, 64, ink_threshold=245)
+    precise = _warp_bgr_affine_numpy(source, matrix, 64, 64)
+
+    np.testing.assert_array_equal(_ink_mask(accelerated, 245), _ink_mask(precise, 245))
+
+
+def test_fast_qt_affine_path_accepts_read_only_source_images() -> None:
+    source = _blank(64, 64)
+    source[12:45, 20] = (0, 0, 0)
+    source.setflags(write=False)
+    matrix = np.array([[1, 0, 0.003], [0, 1, -0.002]], dtype=np.float32)
+
+    accelerated = _warp_bgr_affine(source, matrix, 64, 64, ink_threshold=245)
+    precise = _warp_bgr_affine_numpy(source, matrix, 64, 64)
+
+    np.testing.assert_array_equal(_ink_mask(accelerated, 245), _ink_mask(precise, 245))
+
+
+def test_rotated_affine_transform_uses_exact_numpy_fallback() -> None:
+    source = _blank(64, 64)
+    source[12:45, 20] = (0, 0, 0)
+    radians = np.deg2rad(0.5)
+    matrix = np.array(
+        [[np.cos(radians), np.sin(radians), 0], [-np.sin(radians), np.cos(radians), 0]],
+        dtype=np.float32,
+    )
+
+    assert not _can_use_qt_affine_warp(matrix, ink_threshold=245)
+    np.testing.assert_array_equal(
+        _warp_bgr_affine(source, matrix, 64, 64, ink_threshold=245),
+        _warp_bgr_affine_numpy(source, matrix, 64, 64),
+    )
+
+
+def test_qt_affine_path_rejects_scale_and_shear() -> None:
+    assert not _can_use_qt_affine_warp(
+        np.array([[2, 0, 0], [0, 0.5, 0]], dtype=np.float32),
+        ink_threshold=245,
+    )
+    assert not _can_use_qt_affine_warp(
+        np.array([[1, 0.5, 0], [0, 1, 0]], dtype=np.float32),
+        ink_threshold=245,
+    )
 
 
 def test_blank_pages_are_safe_and_have_no_differences() -> None:

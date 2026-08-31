@@ -1,4 +1,4 @@
-"""PDF rendering and pixel comparison independent of any user-interface toolkit.
+"""PDF rendering and pixel comparison for native image-based review.
 
 The returned BGRA arrays are deliberately suitable for direct conversion to a
 ``QImage.Format_ARGB32`` by a PyQt application.  The comparison method uses
@@ -9,6 +9,7 @@ small rasterisation shifts therefore do not become differences.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import atan2, degrees, hypot
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -16,12 +17,28 @@ import cv2
 import pymupdf as fitz
 import numpy as np
 from PIL import Image
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QImage, QPainter, QTransform
 
-from .colors import DifferenceColors
+from pdf_differences_viewer.colors import DifferenceColors
 
 
 ProgressCallback = Callable[[str, float], None]
 BBox = tuple[int, int, int, int]  # x, y, width, height
+DEFAULT_INK_THRESHOLD = 245
+
+
+class AffineWarpSettings:
+    """Tuning values for the accelerated, Qt-backed affine path.
+
+    Qt's raster interpolation is very fast but not byte-identical to the
+    NumPy sampler. Pixels near the ink threshold are therefore resampled by
+    the NumPy implementation before the difference masks are created.
+    """
+
+    QT_MAX_ROTATION_DEGREES = 0.0001
+    GRAY_GUARD_BAND = 32
+    MAX_GUARDED_PIXEL_FRACTION = 0.25
 
 
 @dataclass(frozen=True)
@@ -177,7 +194,178 @@ def _resize_bgr(image: np.ndarray, target_width: int, target_height: int) -> np.
     return np.ascontiguousarray(np.asarray(resized_rgb)[:, :, ::-1])
 
 
-def _warp_bgr_affine(image: np.ndarray, matrix: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
+def _warp_bgr_affine(
+    image: np.ndarray,
+    matrix: np.ndarray,
+    target_width: int,
+    target_height: int,
+    *,
+    ink_threshold: int = DEFAULT_INK_THRESHOLD,
+) -> np.ndarray:
+    """Apply an inverse-map affine transform, favoring a fast Qt raster path.
+
+    Pure translations and vanishingly small rotations are common in scanned
+    drawings. Qt handles those operations in native code. Its few pixels
+    around the ink threshold are repaired with the exact NumPy sampler so the
+    reported changes remain stable. Larger rotations use the fully precise
+    NumPy implementation below.
+    """
+    transform = np.asarray(matrix, dtype=np.float32).reshape(2, 3)
+    if _can_use_qt_affine_warp(transform, ink_threshold):
+        try:
+            accelerated = _warp_bgr_affine_qt(
+                image,
+                transform,
+                target_width,
+                target_height,
+                ink_threshold,
+            )
+        except (RuntimeError, TypeError, ValueError):
+            accelerated = None
+        if accelerated is not None:
+            return accelerated
+    return _warp_bgr_affine_numpy(image, transform, target_width, target_height)
+
+
+def _can_use_qt_affine_warp(matrix: np.ndarray, ink_threshold: int) -> bool:
+    """Return whether Qt's fast path can preserve the thresholded result."""
+    # Custom thresholds retain the all-NumPy path, which is exact for every
+    # accepted transform rather than just the near-translation fast case.
+    if ink_threshold != DEFAULT_INK_THRESHOLD or not np.isfinite(matrix).all():
+        return False
+    a, b, _ = matrix[0]
+    c, d, _ = matrix[1]
+    determinant = float(a * d - b * c)
+    rotation = abs(degrees(atan2(float(c), float(a))))
+    return (
+        abs(determinant - 1.0) <= 1e-3
+        and rotation <= AffineWarpSettings.QT_MAX_ROTATION_DEGREES
+        and abs(hypot(float(a), float(c)) - 1.0) <= 1e-3
+        and abs(hypot(float(b), float(d)) - 1.0) <= 1e-3
+        and abs(float(a * b + c * d)) <= 1e-3
+    )
+
+
+def _warp_bgr_affine_qt(
+    image: np.ndarray,
+    matrix: np.ndarray,
+    target_width: int,
+    target_height: int,
+    ink_threshold: int,
+) -> np.ndarray | None:
+    """Use Qt's native raster engine, then repair threshold-edge pixels.
+
+    ``None`` asks the caller to use the exact all-NumPy path instead. This
+    happens for image content with too many threshold-adjacent pixels, where
+    the repair would no longer be an acceleration.
+    """
+    source = np.ascontiguousarray(image)
+    if not source.flags.writeable:
+        source = source.copy()
+    source_height, source_width = source.shape[:2]
+    a, b, translate_x = (float(value) for value in matrix[0])
+    c, d, translate_y = (float(value) for value in matrix[1])
+    determinant = a * d - b * c
+    if abs(determinant) < 1e-8:
+        return None
+
+    source_image = QImage(
+        source.data,
+        source_width,
+        source_height,
+        source.strides[0],
+        QImage.Format.Format_BGR888,
+    )
+    output_image = QImage(target_width, target_height, QImage.Format.Format_BGR888)
+    output_image.fill(Qt.GlobalColor.white)
+    forward = QTransform(
+        d / determinant,
+        -c / determinant,
+        0.0,
+        -b / determinant,
+        a / determinant,
+        0.0,
+        (b * translate_y - d * translate_x) / determinant,
+        (c * translate_x - a * translate_y) / determinant,
+        1.0,
+    )
+    painter = QPainter(output_image)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    painter.setTransform(forward)
+    painter.drawImage(0, 0, source_image)
+    painter.end()
+
+    bits = output_image.bits()
+    bits.setsize(output_image.sizeInBytes())
+    accelerated = np.frombuffer(bits, dtype=np.uint8).reshape(
+        target_height,
+        output_image.bytesPerLine(),
+    )
+    accelerated = accelerated[:, : target_width * 3].reshape(target_height, target_width, 3).copy()
+    return _repair_affine_threshold_pixels(
+        accelerated,
+        source,
+        matrix,
+        ink_threshold,
+    )
+
+
+def _repair_affine_threshold_pixels(
+    accelerated: np.ndarray,
+    source_image: np.ndarray,
+    matrix: np.ndarray,
+    ink_threshold: int,
+) -> np.ndarray | None:
+    """Resample only threshold-adjacent pixels with the exact NumPy formula."""
+    gray = _bgr_to_gray(accelerated)
+    lower_bound = max(0, ink_threshold - AffineWarpSettings.GRAY_GUARD_BAND)
+    # The near-translation restriction and broad repair band cover pixels that
+    # could affect the default threshold. Excluding pure white avoids revisiting
+    # the full paper background.
+    upper_bound = min(254, ink_threshold + AffineWarpSettings.GRAY_GUARD_BAND)
+    ys, xs = np.nonzero((gray >= lower_bound) & (gray <= upper_bound))
+    max_guarded_pixels = (
+        accelerated.shape[0]
+        * accelerated.shape[1]
+        * AffineWarpSettings.MAX_GUARDED_PIXEL_FRACTION
+    )
+    if xs.size > max_guarded_pixels:
+        return None
+    if not xs.size:
+        return accelerated
+
+    source_height, source_width = source_image.shape[:2]
+    source = np.pad(source_image, ((1, 1), (1, 1), (0, 0)), constant_values=255)
+    destination_x = xs.astype(np.float32)
+    destination_y = ys.astype(np.float32)
+    source_x = matrix[0, 0] * destination_x + matrix[0, 1] * destination_y + matrix[0, 2]
+    source_y = matrix[1, 0] * destination_x + matrix[1, 1] * destination_y + matrix[1, 2]
+    left_x = np.floor(source_x).astype(np.int32)
+    top_y = np.floor(source_y).astype(np.int32)
+    fraction_x = source_x - left_x
+    fraction_y = source_y - top_y
+
+    left_index = np.clip(left_x, -1, source_width) + 1
+    right_index = np.clip(left_x + 1, -1, source_width) + 1
+    top_index = np.clip(top_y, -1, source_height) + 1
+    bottom_index = np.clip(top_y + 1, -1, source_height) + 1
+    top_left = source[top_index, left_index].astype(np.float32)
+    top_right = source[top_index, right_index].astype(np.float32)
+    bottom_left = source[bottom_index, left_index].astype(np.float32)
+    bottom_right = source[bottom_index, right_index].astype(np.float32)
+    top = top_left * (1.0 - fraction_x[:, np.newaxis]) + top_right * fraction_x[:, np.newaxis]
+    bottom = bottom_left * (1.0 - fraction_x[:, np.newaxis]) + bottom_right * fraction_x[:, np.newaxis]
+    interpolated = top * (1.0 - fraction_y[:, np.newaxis]) + bottom * fraction_y[:, np.newaxis]
+    accelerated[ys, xs] = np.clip(np.rint(interpolated), 0, 255).astype(np.uint8)
+    return accelerated
+
+
+def _warp_bgr_affine_numpy(
+    image: np.ndarray,
+    matrix: np.ndarray,
+    target_width: int,
+    target_height: int,
+) -> np.ndarray:
     """Apply an inverse-map affine matrix with NumPy bilinear sampling.
 
     ``findTransformECC`` and ``phaseCorrelate`` provide matrices that map each
@@ -224,7 +412,12 @@ def _ink_mask(bgr: np.ndarray, ink_threshold: int) -> np.ndarray:
     return np.where(gray < ink_threshold, 255, 0).astype(np.uint8)
 
 
-def _align_old_to_new(old_bgr: np.ndarray, new_bgr: np.ndarray) -> tuple[np.ndarray, AlignmentMetadata]:
+def _align_old_to_new(
+    old_bgr: np.ndarray,
+    new_bgr: np.ndarray,
+    *,
+    ink_threshold: int = DEFAULT_INK_THRESHOLD,
+) -> tuple[np.ndarray, AlignmentMetadata]:
     target_h, target_w = new_bgr.shape[:2]
     old_h, old_w = old_bgr.shape[:2]
     resized = _resize_bgr(old_bgr, target_w, target_h)
@@ -257,12 +450,24 @@ def _align_old_to_new(old_bgr: np.ndarray, new_bgr: np.ndarray) -> tuple[np.ndar
         )
         if not np.isfinite(score) or score < 0.50:
             return resized, AlignmentMetadata(**{**base.__dict__, "message": f"ECC score {score:.3f} was too low; resize only"})
-        aligned = _warp_bgr_affine(resized, matrix, target_w, target_h)
+        aligned = _warp_bgr_affine(
+            resized,
+            matrix,
+            target_w,
+            target_h,
+            ink_threshold=ink_threshold,
+        )
         moved = not np.allclose(matrix, np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32), atol=0.15)
         return aligned, AlignmentMetadata("ecc-euclidean", True, float(score), matrix, (old_w, old_h), (target_w, target_h), moved)
     except cv2.error as exc:
         if phase_is_plausible:
-            aligned = _warp_bgr_affine(resized, matrix, target_w, target_h)
+            aligned = _warp_bgr_affine(
+                resized,
+                matrix,
+                target_w,
+                target_h,
+                ink_threshold=ink_threshold,
+            )
             moved = not np.allclose(matrix, np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32), atol=0.15)
             return aligned, AlignmentMetadata(
                 "phase-correlation",
@@ -330,7 +535,7 @@ def compare_page_images(
     new_image: np.ndarray,
     *,
     tolerance_px: float = 2.0,
-    ink_threshold: int = 245,
+    ink_threshold: int = DEFAULT_INK_THRESHOLD,
     minimum_region_area: int = 4,
     region_merge_distance: int = 20,
     overlay_alpha: int = 180,
@@ -346,7 +551,11 @@ def compare_page_images(
     _progress(progress, "normalizing images", 0.05)
     old_bgr, new_bgr = _as_bgr(old_image), _as_bgr(new_image)
     _progress(progress, "aligning pages", 0.20)
-    old_aligned, alignment = _align_old_to_new(old_bgr, new_bgr)
+    old_aligned, alignment = _align_old_to_new(
+        old_bgr,
+        new_bgr,
+        ink_threshold=ink_threshold,
+    )
     _progress(progress, "finding ink", 0.55)
     old_ink, new_ink = _ink_mask(old_aligned, ink_threshold), _ink_mask(new_bgr, ink_threshold)
     added_mask = _difference_mask(new_ink, old_ink, tolerance_px)
