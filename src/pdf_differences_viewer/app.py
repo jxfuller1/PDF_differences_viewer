@@ -447,9 +447,6 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-
-
-
 def main(argv: list[str] | None = None) -> int:
     application = QApplication(argv if argv is not None else sys.argv)
     window = MainWindow()
