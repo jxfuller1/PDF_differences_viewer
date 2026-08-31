@@ -20,7 +20,7 @@ from PIL import Image
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QImage, QPainter, QTransform
 
-from pdf_differences_viewer.colors import DifferenceColors
+from colors import DifferenceColors
 
 
 ProgressCallback = Callable[[str, float], None]

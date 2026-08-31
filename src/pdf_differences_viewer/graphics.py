@@ -25,7 +25,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene, QGraphicsView, QWidget
 
-from pdf_differences_viewer.colors import DifferenceColors
+from colors import DifferenceColors
 
 
 class ChangeBoxPulseSettings:
