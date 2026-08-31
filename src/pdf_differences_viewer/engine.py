@@ -16,6 +16,8 @@ import cv2
 import pymupdf as fitz
 import numpy as np
 
+from .colors import DifferenceColors
+
 
 ProgressCallback = Callable[[str, float], None]
 BBox = tuple[int, int, int, int]  # x, y, width, height
@@ -250,7 +252,7 @@ def compare_page_images(
     overlay_alpha: int = 180,
     progress: ProgressCallback | None = None,
 ) -> ComparisonResult:
-    """Compare two page rasters, returning transparent red-add/blue-remove layers.
+    """Compare two page rasters, returning transparent blue-add/red-remove layers.
 
     Images may have different sizes and can be gray, BGR, or BGRA.  The new
     image defines the result canvas; the old image is resized then aligned.
@@ -268,8 +270,10 @@ def compare_page_images(
     _progress(progress, "extracting regions", 0.75)
     added_regions = _regions(added_mask, "added", minimum_region_area, region_merge_distance)
     removed_regions = _regions(removed_mask, "removed", minimum_region_area, region_merge_distance)
-    # Red and blue are BGRA here, matching OpenCV/QImage byte order on Windows.
-    added_layer, removed_layer = _layer(added_mask, (0, 0, 255), overlay_alpha), _layer(removed_mask, (255, 0, 0), overlay_alpha)
+    # Layers are BGRA here, matching OpenCV/QImage byte order on Windows.
+    # Added ink is bright blue; removed ink is bright red.
+    added_layer = _layer(added_mask, DifferenceColors.ADDITION_BGR, overlay_alpha)
+    removed_layer = _layer(removed_mask, DifferenceColors.REMOVAL_BGR, overlay_alpha)
     old_bgra, new_bgra = cv2.cvtColor(old_aligned, cv2.COLOR_BGR2BGRA), cv2.cvtColor(new_bgr, cv2.COLOR_BGR2BGRA)
     added_pixels, removed_pixels = int(np.count_nonzero(added_mask)), int(np.count_nonzero(removed_mask))
     _progress(progress, "comparison complete", 1.0)
