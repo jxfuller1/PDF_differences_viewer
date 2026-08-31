@@ -8,11 +8,20 @@ zooming and reviewing inexpensive even for large rendered pages.
 from __future__ import annotations
 
 import math
-import time
 from typing import Any
 
 import numpy as np
-from PyQt6.QtCore import QPointF, QRectF, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import (
+    QAbstractAnimation,
+    QEasingCurve,
+    QPointF,
+    QPropertyAnimation,
+    QRectF,
+    QTimer,
+    Qt,
+    pyqtProperty,
+    pyqtSignal,
+)
 from PyQt6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene, QGraphicsView, QWidget
 
@@ -23,11 +32,10 @@ class ChangeBoxPulseSettings:
     """Tunable animation settings for the pulsing change rectangles.
 
     Increase ``PERIOD_MS`` for a slower pulse or decrease it for a faster one.
-    ``FRAME_INTERVAL_MS`` controls how often the animation is redrawn.
+    Qt's ``QPropertyAnimation`` handles interpolation and repaint timing.
     """
 
     PERIOD_MS = 2_000
-    FRAME_INTERVAL_MS = 33
     MIN_FILL_ALPHA = 18
     MAX_FILL_ALPHA = 82
     MIN_OUTLINE_ALPHA = 145
@@ -144,10 +152,14 @@ class ComparisonGraphicsWidget(QWidget):
         self._blend = 50
         self._toggles = {"added": True, "removed": True, "annotations": True, "moved": True}
         self._fit_pending = False
-        self._pulse_timer = QTimer(self)
-        self._pulse_timer.setInterval(ChangeBoxPulseSettings.FRAME_INTERVAL_MS)
-        self._pulse_timer.timeout.connect(self._update_box_pulse)
-        self._pulse_started_at = time.monotonic()
+        self._pulse_strength = 0.0
+        self._pulse_animation = QPropertyAnimation(self, b"pulse_strength", self)
+        self._pulse_animation.setDuration(max(1, ChangeBoxPulseSettings.PERIOD_MS))
+        self._pulse_animation.setStartValue(0.0)
+        self._pulse_animation.setKeyValueAt(0.5, 1.0)
+        self._pulse_animation.setEndValue(0.0)
+        self._pulse_animation.setEasingCurve(QEasingCurve.Type.InOutSine)
+        self._pulse_animation.setLoopCount(-1)
         self.view.item_clicked.connect(self._on_click)
         self.view.item_double_clicked.connect(self._on_double_click)
 
@@ -157,7 +169,8 @@ class ComparisonGraphicsWidget(QWidget):
 
     def set_result(self, result: Any | None) -> None:
         self._result = result
-        self._pulse_timer.stop()
+        self._pulse_animation.stop()
+        self._pulse_animation.setCurrentTime(0)
         self.scene.clear(); self._items.clear(); self._box_colors.clear(); self._layers.clear()
         if result is None:
             return
@@ -176,7 +189,6 @@ class ComparisonGraphicsWidget(QWidget):
                 self.scene.addItem(rect)
                 self._items[ident] = rect
                 self._box_colors[ident] = color
-        self._pulse_started_at = time.monotonic()
         self._apply_state(); self._request_initial_fit()
 
     def set_blend(self, value: int) -> None:
@@ -198,7 +210,7 @@ class ComparisonGraphicsWidget(QWidget):
         for ident, item in self._items.items():
             kind = ident.split(":", 1)[0]
             item.setVisible(self._toggles["annotations"] and self._toggles[kind])
-        self._refresh_pulse_timer()
+        self._refresh_pulse_animation()
 
     def _set_toggle(self, name: str, enabled: bool) -> None:
         self._toggles[name] = bool(enabled); self._apply_state()
@@ -237,37 +249,23 @@ class ComparisonGraphicsWidget(QWidget):
         self.scene.clearSelection()
         self._items[ident].setSelected(True)
 
-    def _refresh_pulse_timer(self) -> None:
-        """Run the animation only while at least one change box is visible."""
-        if any(item.isVisible() for item in self._items.values()):
-            if not self._pulse_timer.isActive():
-                self._pulse_started_at = time.monotonic()
-                self._pulse_timer.start()
-            self._update_box_pulse()
-        else:
-            self._pulse_timer.stop()
+    def _get_pulse_strength(self) -> float:
+        return self._pulse_strength
 
-    def _update_box_pulse(self) -> None:
-        """Apply one slow, translucent pulse to every visible change box."""
-        if not any(item.isVisible() for item in self._items.values()):
-            self._pulse_timer.stop()
-            return
-        elapsed_ms = (time.monotonic() - self._pulse_started_at) * 1000
-        period_ms = max(1, ChangeBoxPulseSettings.PERIOD_MS)
-        phase = (elapsed_ms % period_ms) / period_ms
-        # Start at the subtle end of the pulse, smoothly swell, then recede.
-        strength = (math.sin(math.tau * phase - math.pi / 2) + 1.0) / 2.0
+    def _set_pulse_strength(self, strength: float) -> None:
+        """Apply the value supplied by ``QPropertyAnimation`` to every box."""
+        self._pulse_strength = max(0.0, min(1.0, float(strength)))
         fill_alpha = round(
             ChangeBoxPulseSettings.MIN_FILL_ALPHA
-            + strength * (ChangeBoxPulseSettings.MAX_FILL_ALPHA - ChangeBoxPulseSettings.MIN_FILL_ALPHA)
+            + self._pulse_strength * (ChangeBoxPulseSettings.MAX_FILL_ALPHA - ChangeBoxPulseSettings.MIN_FILL_ALPHA)
         )
         outline_alpha = round(
             ChangeBoxPulseSettings.MIN_OUTLINE_ALPHA
-            + strength * (ChangeBoxPulseSettings.MAX_OUTLINE_ALPHA - ChangeBoxPulseSettings.MIN_OUTLINE_ALPHA)
+            + self._pulse_strength * (ChangeBoxPulseSettings.MAX_OUTLINE_ALPHA - ChangeBoxPulseSettings.MIN_OUTLINE_ALPHA)
         )
         pen_width = (
             ChangeBoxPulseSettings.MIN_PEN_WIDTH
-            + strength * (ChangeBoxPulseSettings.MAX_PEN_WIDTH - ChangeBoxPulseSettings.MIN_PEN_WIDTH)
+            + self._pulse_strength * (ChangeBoxPulseSettings.MAX_PEN_WIDTH - ChangeBoxPulseSettings.MIN_PEN_WIDTH)
         )
         for ident, item in self._items.items():
             color = self._box_colors[ident]
@@ -275,6 +273,17 @@ class ComparisonGraphicsWidget(QWidget):
             pen.setCosmetic(True)
             item.setPen(pen)
             item.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), fill_alpha)))
+
+    pulse_strength = pyqtProperty(float, _get_pulse_strength, _set_pulse_strength)
+
+    def _refresh_pulse_animation(self) -> None:
+        """Animate only while at least one change box is visible."""
+        if any(item.isVisible() for item in self._items.values()):
+            if self._pulse_animation.state() != QAbstractAnimation.State.Running:
+                self._pulse_animation.setCurrentTime(0)
+                self._pulse_animation.start()
+        else:
+            self._pulse_animation.stop()
 
     def _request_initial_fit(self) -> None:
         """Fit once after the widget receives a usable viewport size.

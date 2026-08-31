@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import time
-
 import cv2
 import numpy as np
-from PyQt6.QtCore import QPoint, QPointF, Qt
+from PyQt6.QtCore import QAbstractAnimation, QPoint, QPointF, Qt
 from PyQt6.QtGui import QWheelEvent
 from PyQt6.QtWidgets import QGraphicsView
 
@@ -67,7 +65,8 @@ def test_change_boxes_pulse_in_semantic_color_and_use_hand_cursor(qapp) -> None:
 
     ident, box = next(iter(viewer._items.items()))
     assert ident.startswith("added:")
-    assert viewer._pulse_timer.isActive()
+    assert viewer._pulse_animation.state() == QAbstractAnimation.State.Running
+    assert viewer._pulse_animation.propertyName() == b"pulse_strength"
     assert box.acceptHoverEvents()
     assert box.cursor().shape() == Qt.CursorShape.PointingHandCursor
     assert viewer.view.itemAt(viewer.view.mapFromScene(box.rect().center())) is box
@@ -79,12 +78,16 @@ def test_change_boxes_pulse_in_semantic_color_and_use_hand_cursor(qapp) -> None:
     assert ChangeBoxPulseSettings.MIN_FILL_ALPHA <= box.brush().color().alpha() <= ChangeBoxPulseSettings.MAX_FILL_ALPHA
     assert box.brush().color().alpha() < 255
 
-    # Move precisely to the pulse peak to prove the tunable animation changes
+    # Move the QPropertyAnimation precisely to its peak to prove it changes
     # both the outline and translucent interior.
-    viewer._pulse_started_at = time.monotonic() - ChangeBoxPulseSettings.PERIOD_MS / 2_000
-    viewer._update_box_pulse()
+    viewer._pulse_animation.setCurrentTime(ChangeBoxPulseSettings.PERIOD_MS // 2)
     assert box.pen().color().alpha() == ChangeBoxPulseSettings.MAX_OUTLINE_ALPHA
     assert box.brush().color().alpha() == ChangeBoxPulseSettings.MAX_FILL_ALPHA
+
+    viewer.toggle_annotations(False)
+    assert viewer._pulse_animation.state() == QAbstractAnimation.State.Stopped
+    viewer.toggle_annotations(True)
+    assert viewer._pulse_animation.state() == QAbstractAnimation.State.Running
 
 
 def test_zoom_requires_control_and_view_never_uses_pan_hand_drag(qapp) -> None:
