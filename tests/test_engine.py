@@ -5,11 +5,59 @@ import pymupdf as fitz
 import numpy as np
 
 from pdf_differences_viewer.colors import DifferenceColors
-from pdf_differences_viewer.engine import compare_page_images, compare_pdf_pages, render_pdf_page
+from pdf_differences_viewer.engine import (
+    _bgr_to_bgra,
+    _bgr_to_gray,
+    _gray_to_bgr,
+    _resize_bgr,
+    _rgb_to_bgr,
+    _warp_bgr_affine,
+    compare_page_images,
+    compare_pdf_pages,
+    render_pdf_page,
+)
 
 
 def _blank(height: int = 180, width: int = 240) -> np.ndarray:
     return np.full((height, width, 3), 255, dtype=np.uint8)
+
+
+def test_numpy_channel_conversions_preserve_expected_color_layout() -> None:
+    rgb = np.array([[[1, 2, 3], [10, 20, 30]]], dtype=np.uint8)
+    bgr = _rgb_to_bgr(rgb)
+
+    np.testing.assert_array_equal(bgr, [[[3, 2, 1], [30, 20, 10]]])
+    assert bgr.flags.c_contiguous
+    np.testing.assert_array_equal(
+        _gray_to_bgr(np.array([[0, 128]], dtype=np.uint8)),
+        [[[0, 0, 0], [128, 128, 128]]],
+    )
+    np.testing.assert_array_equal(
+        _bgr_to_gray(np.array([[[0, 0, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255]]], dtype=np.uint8)),
+        [[0, 29, 150, 76]],
+    )
+    bgra = _bgr_to_bgra(bgr)
+    np.testing.assert_array_equal(bgra[:, :, :3], bgr)
+    assert np.all(bgra[:, :, 3] == 255)
+
+
+def test_pillow_resize_and_numpy_affine_warp_preserve_bgr_geometry() -> None:
+    source = _blank(5, 5)
+    source[2, 3] = (0, 0, 0)
+
+    resized = _resize_bgr(source, 10, 8)
+    assert resized.shape == (8, 10, 3)
+    assert resized.flags.c_contiguous
+    identity = _resize_bgr(source, 5, 5)
+    np.testing.assert_array_equal(identity, source)
+    assert identity is not source
+
+    # The affine matrix is destination-to-source, matching the former
+    # cv2.WARP_INVERSE_MAP call: source x=3 appears at destination x=2.
+    matrix = np.array([[1, 0, 1], [0, 1, 0]], dtype=np.float32)
+    warped = _warp_bgr_affine(source, matrix, 5, 5)
+    np.testing.assert_array_equal(warped[2, 2], (0, 0, 0))
+    assert np.count_nonzero(np.all(warped == 0, axis=2)) == 1
 
 
 def test_blank_pages_are_safe_and_have_no_differences() -> None:

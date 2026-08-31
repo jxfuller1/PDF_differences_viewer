@@ -15,6 +15,7 @@ from typing import Callable, Optional, Sequence
 import cv2
 import pymupdf as fitz
 import numpy as np
+from PIL import Image
 
 from .colors import DifferenceColors
 
@@ -105,41 +106,131 @@ def render_pdf_page(
         if not 0 <= page_index < document.page_count:
             raise ValueError(f"page_index {page_index} is outside 0..{document.page_count - 1}")
         _progress(progress, "rendering page", 0.25)
-        pixmap = document.load_page(page_index).get_pixmap(matrix=fitz.Matrix(dpi / 72.0, dpi / 72.0), alpha=False)
+        pixmap = document.load_page(page_index).get_pixmap(
+            matrix=fitz.Matrix(dpi / 72.0, dpi / 72.0),
+            alpha=False,
+        )
         rgb = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(pixmap.height, pixmap.width, pixmap.n)
         if pixmap.n == 1:
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_GRAY2BGR)
+            bgr = _gray_to_bgr(rgb[:, :, 0])
         else:
-            bgr = cv2.cvtColor(rgb[:, :, :3], cv2.COLOR_RGB2BGR)
-    bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+            bgr = _rgb_to_bgr(rgb[:, :, :3])
+    bgra = _bgr_to_bgra(bgr)
     _progress(progress, "page rendered", 1.0)
-    return RenderedPage(bgra=np.ascontiguousarray(bgra), page_index=page_index, width=bgra.shape[1], height=bgra.shape[0], dpi=dpi)
+    return RenderedPage(
+        bgra=np.ascontiguousarray(bgra),
+        page_index=page_index,
+        width=bgra.shape[1],
+        height=bgra.shape[0],
+        dpi=dpi,
+    )
 
 
 def _as_bgr(image: np.ndarray) -> np.ndarray:
     if not isinstance(image, np.ndarray) or image.size == 0:
         raise ValueError("image must be a non-empty numpy array")
     if image.ndim == 2:
-        return cv2.cvtColor(image.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        return _gray_to_bgr(image.astype(np.uint8))
     if image.ndim != 3 or image.shape[2] not in (3, 4):
         raise ValueError("image must have 1, 3, or 4 channels")
     image = image.astype(np.uint8, copy=False)
-    return image[:, :, :3].copy()
+    return np.ascontiguousarray(image[:, :, :3])
+
+
+def _rgb_to_bgr(rgb: np.ndarray) -> np.ndarray:
+    """Return a contiguous BGR copy of an RGB image without OpenCV."""
+    return np.ascontiguousarray(rgb[:, :, ::-1])
+
+
+def _gray_to_bgr(gray: np.ndarray) -> np.ndarray:
+    """Expand one gray channel into contiguous BGR channels."""
+    return np.repeat(gray[:, :, np.newaxis], 3, axis=2)
+
+
+def _bgr_to_bgra(bgr: np.ndarray) -> np.ndarray:
+    """Append an opaque alpha channel to a BGR image."""
+    alpha = np.full((*bgr.shape[:2], 1), 255, dtype=np.uint8)
+    return np.concatenate((bgr, alpha), axis=2)
+
+
+def _bgr_to_gray(bgr: np.ndarray) -> np.ndarray:
+    """Convert BGR to luma with the standard BT.601 integer coefficients."""
+    channels = bgr.astype(np.uint32, copy=False)
+    return (
+        (channels[:, :, 2] * 299 + channels[:, :, 1] * 587 + channels[:, :, 0] * 114 + 500)
+        // 1000
+    ).astype(np.uint8)
+
+
+def _resize_bgr(image: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
+    """Resize a BGR image with Pillow, preserving the requested exact size."""
+    if image.shape[:2] == (target_height, target_width):
+        return image.copy()
+    source_height, source_width = image.shape[:2]
+    resample = (
+        Image.Resampling.BOX
+        if source_width * source_height > target_width * target_height
+        else Image.Resampling.BICUBIC
+    )
+    rgb = Image.fromarray(np.ascontiguousarray(image[:, :, ::-1]))
+    resized_rgb = rgb.resize((target_width, target_height), resample=resample)
+    return np.ascontiguousarray(np.asarray(resized_rgb)[:, :, ::-1])
+
+
+def _warp_bgr_affine(image: np.ndarray, matrix: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
+    """Apply an inverse-map affine matrix with NumPy bilinear sampling.
+
+    ``findTransformECC`` and ``phaseCorrelate`` provide matrices that map each
+    destination pixel back to the source image.  Processing modest row chunks
+    keeps this OpenCV-free resampler practical for high-DPI drawings while
+    preserving a white border outside the source page.
+    """
+    source_height, source_width = image.shape[:2]
+    transform = np.asarray(matrix, dtype=np.float32).reshape(2, 3)
+    output = np.empty((target_height, target_width, 3), dtype=np.uint8)
+    source = np.pad(image, ((1, 1), (1, 1), (0, 0)), constant_values=255)
+    destination_x = np.arange(target_width, dtype=np.float32)[np.newaxis, :]
+
+    for start_y in range(0, target_height, 256):
+        end_y = min(start_y + 256, target_height)
+        destination_y = np.arange(start_y, end_y, dtype=np.float32)[:, np.newaxis]
+        source_x = transform[0, 0] * destination_x + transform[0, 1] * destination_y + transform[0, 2]
+        source_y = transform[1, 0] * destination_x + transform[1, 1] * destination_y + transform[1, 2]
+        left_x = np.floor(source_x).astype(np.int32)
+        top_y = np.floor(source_y).astype(np.int32)
+        fraction_x = source_x - left_x
+        fraction_y = source_y - top_y
+
+        left_index = np.clip(left_x, -1, source_width) + 1
+        right_index = np.clip(left_x + 1, -1, source_width) + 1
+        top_index = np.clip(top_y, -1, source_height) + 1
+        bottom_index = np.clip(top_y + 1, -1, source_height) + 1
+        top_left = source[top_index, left_index].astype(np.float32)
+        top_right = source[top_index, right_index].astype(np.float32)
+        bottom_left = source[bottom_index, left_index].astype(np.float32)
+        bottom_right = source[bottom_index, right_index].astype(np.float32)
+
+        top = top_left * (1.0 - fraction_x)[..., np.newaxis] + top_right * fraction_x[..., np.newaxis]
+        bottom = bottom_left * (1.0 - fraction_x)[..., np.newaxis] + bottom_right * fraction_x[..., np.newaxis]
+        interpolated = top * (1.0 - fraction_y)[..., np.newaxis] + bottom * fraction_y[..., np.newaxis]
+        output[start_y:end_y] = np.clip(np.rint(interpolated), 0, 255).astype(np.uint8)
+
+    return output
 
 
 def _ink_mask(bgr: np.ndarray, ink_threshold: int) -> np.ndarray:
     """Mark non-paper pixels.  White/near-white pages remain safely empty."""
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray = _bgr_to_gray(bgr)
     return np.where(gray < ink_threshold, 255, 0).astype(np.uint8)
 
 
 def _align_old_to_new(old_bgr: np.ndarray, new_bgr: np.ndarray) -> tuple[np.ndarray, AlignmentMetadata]:
     target_h, target_w = new_bgr.shape[:2]
     old_h, old_w = old_bgr.shape[:2]
-    resized = cv2.resize(old_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA if old_w * old_h > target_w * target_h else cv2.INTER_CUBIC)
+    resized = _resize_bgr(old_bgr, target_w, target_h)
     base = AlignmentMetadata("resize", True, original_old_size=(old_w, old_h), target_size=(target_w, target_h), moved=(old_w, old_h) != (target_w, target_h))
-    old_gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    new_gray = cv2.cvtColor(new_bgr, cv2.COLOR_BGR2GRAY)
+    old_gray = _bgr_to_gray(resized)
+    new_gray = _bgr_to_gray(new_bgr)
     # ECC is deterministic and particularly effective for scanned/printed pages.
     if old_gray.std() < 1.0 or new_gray.std() < 1.0:
         return resized, AlignmentMetadata(**{**base.__dict__, "message": "blank or near-uniform page; resize only"})
@@ -166,19 +257,12 @@ def _align_old_to_new(old_bgr: np.ndarray, new_bgr: np.ndarray) -> tuple[np.ndar
         )
         if not np.isfinite(score) or score < 0.50:
             return resized, AlignmentMetadata(**{**base.__dict__, "message": f"ECC score {score:.3f} was too low; resize only"})
-        aligned = cv2.warpAffine(resized, matrix, (target_w, target_h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+        aligned = _warp_bgr_affine(resized, matrix, target_w, target_h)
         moved = not np.allclose(matrix, np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32), atol=0.15)
         return aligned, AlignmentMetadata("ecc-euclidean", True, float(score), matrix, (old_w, old_h), (target_w, target_h), moved)
     except cv2.error as exc:
         if phase_is_plausible:
-            aligned = cv2.warpAffine(
-                resized,
-                matrix,
-                (target_w, target_h),
-                flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=(255, 255, 255),
-            )
+            aligned = _warp_bgr_affine(resized, matrix, target_w, target_h)
             moved = not np.allclose(matrix, np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32), atol=0.15)
             return aligned, AlignmentMetadata(
                 "phase-correlation",
@@ -274,7 +358,7 @@ def compare_page_images(
     # Added ink is bright blue; removed ink is bright red.
     added_layer = _layer(added_mask, DifferenceColors.ADDITION_BGR, overlay_alpha)
     removed_layer = _layer(removed_mask, DifferenceColors.REMOVAL_BGR, overlay_alpha)
-    old_bgra, new_bgra = cv2.cvtColor(old_aligned, cv2.COLOR_BGR2BGRA), cv2.cvtColor(new_bgr, cv2.COLOR_BGR2BGRA)
+    old_bgra, new_bgra = _bgr_to_bgra(old_aligned), _bgr_to_bgra(new_bgr)
     added_pixels, removed_pixels = int(np.count_nonzero(added_mask)), int(np.count_nonzero(removed_mask))
     _progress(progress, "comparison complete", 1.0)
     return ComparisonResult(np.ascontiguousarray(old_bgra), np.ascontiguousarray(new_bgra), added_layer, removed_layer, added_mask, removed_mask, added_regions, removed_regions, alignment, new_bgr.shape[1], new_bgr.shape[0], added_pixels, removed_pixels, int(np.count_nonzero((added_mask > 0) | (removed_mask > 0))))
