@@ -9,6 +9,7 @@ from pdf_differences_viewer.engine import (
     _bgr_to_bgra,
     _bgr_to_gray,
     _can_use_qt_affine_warp,
+    _dilate_binary_mask,
     _gray_to_bgr,
     _ink_mask,
     _resize_bgr,
@@ -181,6 +182,33 @@ def test_nearby_changed_marks_are_grouped_for_review() -> None:
 
     assert len(result.added_regions) == 1
     assert result.added_regions[0].area > 0
+
+
+def test_binary_mask_dilation_matches_opencv_rectangular_kernels() -> None:
+    rng = np.random.default_rng(7)
+    mask = np.where(rng.random((23, 31)) > 0.88, 255, 0).astype(np.uint8)
+    mask[0, 0] = mask[-1, -1] = 255
+
+    for kernel_size in (1, 2, 3, 4, 20):
+        expected = cv2.dilate(
+            mask,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size)),
+            iterations=1,
+        )
+        np.testing.assert_array_equal(_dilate_binary_mask(mask, kernel_size), expected)
+
+
+def test_sparse_binary_mask_dilation_matches_opencv_at_page_edges() -> None:
+    mask = np.zeros((23, 31), dtype=np.uint8)
+    mask[0, 0] = mask[-1, -1] = 255
+
+    for kernel_size in (2, 3, 20):
+        expected = cv2.dilate(
+            mask,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size)),
+            iterations=1,
+        )
+        np.testing.assert_array_equal(_dilate_binary_mask(mask, kernel_size), expected)
 
 
 def _write_pdf(path, *, add_circle: bool) -> None:
