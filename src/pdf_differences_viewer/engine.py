@@ -53,6 +53,13 @@ class AlignmentSettings:
     FAST_REJECT_MAX_SHIFT_FRACTION = 0.35
 
 
+class DistanceTransformSettings:
+    """Weights used by OpenCV's approximate 3x3 L2 distance transform."""
+
+    AXIAL_COST = np.float32(0.955)
+    DIAGONAL_COST = np.float32(1.3693)
+
+
 class MaskDilationSettings:
     """Tuning values for grouped sparse change masks."""
 
@@ -597,9 +604,73 @@ def _align_old_to_new(
         return resized, AlignmentMetadata(**{**base.__dict__, "message": f"ECC alignment unavailable: {str(exc).splitlines()[0]}"})
 
 
+def _distance_transform_l2_mask3(source: np.ndarray) -> np.ndarray:
+    """Match ``cv2.distanceTransform(source, cv2.DIST_L2, 3)`` with NumPy.
+
+    The 3x3 L2 mode is an approximate two-pass chamfer transform rather than
+    a mathematically exact Euclidean distance.  The passes retain OpenCV's
+    axial and diagonal weights, zero-pixel sources, and infinite border.
+    """
+    nonzero = np.ascontiguousarray(source != 0)
+    height, width = nonzero.shape
+    max_distance = np.finfo(np.float32).max
+    axial_cost = DistanceTransformSettings.AXIAL_COST
+    diagonal_cost = DistanceTransformSettings.DIAGONAL_COST
+    distances = np.where(nonzero, max_distance, 0).astype(np.float32)
+    column_costs = np.arange(width, dtype=np.float32) * axial_cost
+
+    # OpenCV's forward pass considers north-west, north, north-east, and west.
+    for row_index in range(height):
+        if row_index:
+            above = distances[row_index - 1]
+            candidates = above + axial_cost
+            np.minimum(
+                candidates[1:],
+                above[:-1] + diagonal_cost,
+                out=candidates[1:],
+            )
+            np.minimum(
+                candidates[:-1],
+                above[1:] + diagonal_cost,
+                out=candidates[:-1],
+            )
+        else:
+            candidates = np.full(width, max_distance, dtype=np.float32)
+        candidates[~nonzero[row_index]] = 0
+        candidates -= column_costs
+        np.minimum.accumulate(candidates, out=candidates)
+        candidates += column_costs
+        distances[row_index] = candidates
+
+    # OpenCV's backward pass considers south-east, south, south-west, and east.
+    for row_index in range(height - 1, -1, -1):
+        candidates = distances[row_index]
+        if row_index + 1 < height:
+            below = distances[row_index + 1]
+            np.minimum(candidates, below + axial_cost, out=candidates)
+            np.minimum(
+                candidates[1:],
+                below[:-1] + diagonal_cost,
+                out=candidates[1:],
+            )
+            np.minimum(
+                candidates[:-1],
+                below[1:] + diagonal_cost,
+                out=candidates[:-1],
+            )
+        right_to_left = candidates[::-1]
+        right_to_left -= column_costs
+        np.minimum.accumulate(right_to_left, out=right_to_left)
+        right_to_left += column_costs
+
+    return distances
+
+
 def _difference_mask(source_ink: np.ndarray, reference_ink: np.ndarray, tolerance_px: float) -> np.ndarray:
-    # distanceTransform measures each source pixel's distance to reference ink.
-    distance = cv2.distanceTransform(cv2.bitwise_not(reference_ink), cv2.DIST_L2, 3)
+    if tolerance_px == 0:
+        return np.where((source_ink > 0) & (reference_ink == 0), 255, 0).astype(np.uint8)
+    # The transform measures each source pixel's distance to reference ink.
+    distance = _distance_transform_l2_mask3(np.bitwise_not(reference_ink))
     return np.where((source_ink > 0) & (distance > tolerance_px), 255, 0).astype(np.uint8)
 
 
