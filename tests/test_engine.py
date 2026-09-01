@@ -18,6 +18,7 @@ from pdf_differences_viewer.engine import (
     _difference_mask,
     _gray_to_bgr,
     _ink_mask,
+    _phase_correlate,
     _regions,
     _resize_bgr,
     _rgb_to_bgr,
@@ -193,6 +194,27 @@ def test_numpy_distance_transform_preserves_tolerance_masks() -> None:
         np.testing.assert_array_equal(_difference_mask(source, reference, tolerance), expected)
 
 
+def test_numpy_phase_correlate_matches_opencv_shift_and_response() -> None:
+    rng = np.random.default_rng(83)
+    noisy = rng.normal(size=(99, 121)).astype(np.float32)
+    structured = np.full((400, 500), 255, dtype=np.float32)
+    structured[65:180, 90:330] = 0
+    structured[230:315, 170:205] = 72
+    translated = np.full_like(structured, 255)
+    translated[7:, 11:] = structured[:-7, :-11]
+    cases = [
+        (noisy, np.roll(noisy, shift=(7, -11), axis=(0, 1))),
+        (structured, translated),
+        (np.zeros((99, 121), dtype=np.float32), np.zeros((99, 121), dtype=np.float32)),
+    ]
+
+    for first, second in cases:
+        expected_shift, expected_response = cv2.phaseCorrelate(first, second)
+        actual_shift, actual_response = _phase_correlate(first, second)
+        np.testing.assert_allclose(actual_shift, expected_shift, rtol=0, atol=5e-3)
+        np.testing.assert_allclose(actual_response, expected_response, rtol=0, atol=2e-5)
+
+
 def test_old_page_is_resized_to_new_page_dimensions() -> None:
     old = _blank(120, 160)
     new = _blank(200, 300)
@@ -226,7 +248,7 @@ def test_fast_reject_requires_low_phase_confidence_and_low_ink_overlap(monkeypat
     old[12:36, 12:36] = 0
     new[58:82, 82:106] = 0
 
-    monkeypatch.setattr(engine.cv2, "phaseCorrelate", lambda *_args: ((0.0, 0.0), 0.0))
+    monkeypatch.setattr(engine, "_phase_correlate", lambda *_args: ((0.0, 0.0), 0.0))
     monkeypatch.setattr(engine.cv2, "findTransformECC", lambda *_args: (0.1, np.eye(2, 3, dtype=np.float32)))
     assert _should_fast_reject_ecc(_bgr_to_gray(old), _bgr_to_gray(new), 245)
 
@@ -240,7 +262,7 @@ def test_fast_reject_defers_when_coarse_ecc_finds_a_plausible_alignment(monkeypa
     new = _blank(96, 120)
     old[12:36, 12:36] = 0
     new[58:82, 82:106] = 0
-    monkeypatch.setattr(engine.cv2, "phaseCorrelate", lambda *_args: ((0.0, 0.0), 0.0))
+    monkeypatch.setattr(engine, "_phase_correlate", lambda *_args: ((0.0, 0.0), 0.0))
     monkeypatch.setattr(engine.cv2, "findTransformECC", lambda *_args: (0.95, np.eye(2, 3, dtype=np.float32)))
 
     assert not _should_fast_reject_ecc(_bgr_to_gray(old), _bgr_to_gray(new), 245)
@@ -251,7 +273,7 @@ def test_fast_reject_defers_when_coarse_ecc_is_inconclusive(monkeypatch) -> None
     new = _blank(96, 120)
     old[12:36, 12:36] = 0
     new[58:82, 82:106] = 0
-    monkeypatch.setattr(engine.cv2, "phaseCorrelate", lambda *_args: ((0.0, 0.0), 0.0))
+    monkeypatch.setattr(engine, "_phase_correlate", lambda *_args: ((0.0, 0.0), 0.0))
 
     def failed_ecc(*_args):
         raise cv2.error("coarse alignment was inconclusive")
@@ -265,7 +287,7 @@ def test_fast_reject_skips_ecc_and_preserves_resize_only_regions(monkeypatch) ->
     new = _blank(480, 600)
     old[60:180, 60:180] = 0
     new[290:410, 410:530] = 0
-    monkeypatch.setattr(engine.cv2, "phaseCorrelate", lambda *_args: ((0.0, 0.0), 0.0))
+    monkeypatch.setattr(engine, "_phase_correlate", lambda *_args: ((0.0, 0.0), 0.0))
     ecc_shapes: list[tuple[int, int]] = []
 
     def low_score_coarse_ecc(template, *_args):
@@ -294,7 +316,7 @@ def test_fast_reject_defers_to_full_ecc_when_phase_is_plausible(monkeypatch) -> 
     old = _blank(96, 120)
     old[12:36, 12:36] = 0
     calls = 0
-    monkeypatch.setattr(engine.cv2, "phaseCorrelate", lambda *_args: ((0.0, 0.0), 1.0))
+    monkeypatch.setattr(engine, "_phase_correlate", lambda *_args: ((0.0, 0.0), 1.0))
 
     def successful_ecc(*_args):
         nonlocal calls

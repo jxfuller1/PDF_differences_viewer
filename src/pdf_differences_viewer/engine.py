@@ -53,6 +53,13 @@ class AlignmentSettings:
     FAST_REJECT_MAX_SHIFT_FRACTION = 0.35
 
 
+class PhaseCorrelationSettings:
+    """OpenCV-compatible phase-correlation algorithm constants."""
+
+    OPTIMAL_DFT_FACTORS = (2, 3, 5)
+    CENTROID_RADIUS = 2
+
+
 class DistanceTransformSettings:
     """Weights used by OpenCV's approximate 3x3 L2 distance transform."""
 
@@ -393,7 +400,7 @@ def _warp_bgr_affine_numpy(
 ) -> np.ndarray:
     """Apply an inverse-map affine matrix with NumPy bilinear sampling.
 
-    ``findTransformECC`` and ``phaseCorrelate`` provide matrices that map each
+    ``findTransformECC`` and phase correlation provide matrices that map each
     destination pixel back to the source image.  Processing modest row chunks
     keeps this OpenCV-free resampler practical for high-DPI drawings while
     preserving a white border outside the source page.
@@ -447,6 +454,84 @@ def _coarse_gray(image: np.ndarray) -> np.ndarray:
     target_height = max(1, round(height * scale))
     return np.asarray(
         Image.fromarray(image).resize((target_width, target_height), resample=Image.Resampling.BOX)
+    )
+
+
+def _optimal_dft_size(size: int) -> int:
+    """Return OpenCV's next 2/3/5-factorable DFT length."""
+    if size < 1:
+        raise ValueError("DFT size must be positive")
+    candidate = size
+    while True:
+        remainder = candidate
+        for factor in PhaseCorrelationSettings.OPTIMAL_DFT_FACTORS:
+            while remainder % factor == 0:
+                remainder //= factor
+        if remainder == 1:
+            return candidate
+        candidate += 1
+
+
+def _phase_correlate(
+    first: np.ndarray,
+    second: np.ndarray,
+) -> tuple[tuple[float, float], float]:
+    """Return OpenCV-compatible translation and confidence using NumPy FFTs.
+
+    OpenCV zero-pads to efficient DFT dimensions, normalizes the cross-power
+    spectrum, and refines the peak with a clamped 5x5 weighted centroid.  The
+    inverse NumPy FFT is already divided by the image area, so its centroid sum
+    is the same response that OpenCV obtains after its final area division.
+    """
+    first = np.asarray(first)
+    second = np.asarray(second)
+    if first.ndim != 2 or first.shape != second.shape or not first.size:
+        raise ValueError("phase-correlation inputs must be non-empty, same-size 2D arrays")
+    if first.dtype != second.dtype or first.dtype not in (
+        np.dtype(np.float32),
+        np.dtype(np.float64),
+    ):
+        raise ValueError("phase-correlation inputs must have the same float32 or float64 dtype")
+
+    padded_height = _optimal_dft_size(first.shape[0])
+    padded_width = _optimal_dft_size(first.shape[1])
+    padded_shape = (padded_height, padded_width)
+    first_spectrum = np.fft.rfft2(first, s=padded_shape, axes=(-2, -1))
+    second_spectrum = np.fft.rfft2(second, s=padded_shape, axes=(-2, -1))
+    np.conjugate(second_spectrum, out=second_spectrum)
+    np.multiply(first_spectrum, second_spectrum, out=first_spectrum)
+
+    magnitude = np.abs(first_spectrum)
+    floating_info = np.finfo(first.dtype)
+    # P * |P| / (|P|**2 + epsilon), rearranged to avoid overflow.
+    normalizer = np.maximum(magnitude, floating_info.tiny)
+    np.divide(floating_info.eps, normalizer, out=normalizer)
+    np.add(normalizer, magnitude, out=normalizer)
+    np.divide(first_spectrum, normalizer, out=first_spectrum)
+    correlation = np.fft.irfft2(first_spectrum, s=padded_shape, axes=(-2, -1))
+
+    # Locate the unshifted peak, then map only its 5x5 neighborhood into the
+    # shifted coordinate system. This avoids copying the full correlation map.
+    unshifted_y, unshifted_x = np.unravel_index(np.argmax(correlation), correlation.shape)
+    peak_y = (int(unshifted_y) + padded_height // 2) % padded_height
+    peak_x = (int(unshifted_x) + padded_width // 2) % padded_width
+    radius = PhaseCorrelationSettings.CENTROID_RADIUS
+    shifted_ys = np.arange(max(0, peak_y - radius), min(padded_height, peak_y + radius + 1))
+    shifted_xs = np.arange(max(0, peak_x - radius), min(padded_width, peak_x + radius + 1))
+    source_ys = (shifted_ys - padded_height // 2) % padded_height
+    source_xs = (shifted_xs - padded_width // 2) % padded_width
+    centroid_patch = correlation[np.ix_(source_ys, source_xs)].astype(np.float64, copy=False)
+    response = float(np.sum(centroid_patch, dtype=np.float64))
+    denominator = response + np.finfo(np.float64).eps
+    centroid_x = float(
+        np.sum(centroid_patch * shifted_xs[None, :], dtype=np.float64) / denominator
+    )
+    centroid_y = float(
+        np.sum(centroid_patch * shifted_ys[:, None], dtype=np.float64) / denominator
+    )
+    return (
+        (padded_width / 2.0 - centroid_x, padded_height / 2.0 - centroid_y),
+        response,
     )
 
 
@@ -508,10 +593,10 @@ def _should_fast_reject_ecc(old_gray: np.ndarray, new_gray: np.ndarray, ink_thre
     coarse_old = _coarse_gray(old_gray)
     coarse_new = _coarse_gray(new_gray)
     try:
-        shift, phase_score = cv2.phaseCorrelate(
+        shift, phase_score = _phase_correlate(
             coarse_new.astype(np.float32), coarse_old.astype(np.float32)
         )
-    except cv2.error:
+    except (MemoryError, TypeError, ValueError):
         return False
     max_shift = max(coarse_new.shape) * AlignmentSettings.FAST_REJECT_MAX_SHIFT_FRACTION
     phase_is_plausible = (
@@ -553,11 +638,11 @@ def _align_old_to_new(
     # a cheap translation estimate first, which makes ordinary scanner/page
     # offsets reliable instead of falling straight back to resize-only mode.
     try:
-        shift, phase_score = cv2.phaseCorrelate(
+        shift, phase_score = _phase_correlate(
             new_gray.astype(np.float32), old_gray.astype(np.float32)
         )
         matrix = np.float32([[1.0, 0.0, shift[0]], [0.0, 1.0, shift[1]]])
-    except cv2.error:
+    except (MemoryError, TypeError, ValueError):
         shift, phase_score = (0.0, 0.0), 0.0
         matrix = np.eye(2, 3, dtype=np.float32)
     max_shift = max(target_h, target_w) * 0.35
