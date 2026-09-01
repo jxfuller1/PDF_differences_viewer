@@ -519,7 +519,7 @@ def _dilate_sparse_binary_mask_qt(mask: np.ndarray, kernel_size: int) -> np.ndar
     height, width = mask.shape
     anchor = kernel_size // 2
     leading_extent = kernel_size - anchor - 1
-    ys, xs = np.nonzero(mask)
+    ys, xs = np.nonzero(mask > 0)
     output_image = QImage(width, height, QImage.Format.Format_Grayscale8)
     output_image.fill(0)
     rectangles = [
@@ -576,21 +576,40 @@ def _regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distance: int
     else:
         grouped = mask
     count, labels = cv2.connectedComponents(grouped, connectivity=8)
-    regions: list[DifferenceRegion] = []
-    for label in range(1, count):
-        in_group = (labels == label) & (mask > 0)
-        area = int(np.count_nonzero(in_group))
-        if area < minimum_area:
-            continue
-        ys, xs = np.nonzero(in_group)
-        regions.append(
-            DifferenceRegion(
-                (int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)),
-                area,
-                kind,
-            )
+    # Work only with changed pixels once.  The former implementation compared
+    # every page pixel against every component label, which becomes especially
+    # expensive at high DPI when a page has many regions.
+    ys, xs = np.nonzero(mask)
+    pixel_labels = labels[ys, xs]
+    areas = np.bincount(pixel_labels, minlength=count)
+    eligible_labels = np.flatnonzero(areas >= minimum_area)
+    eligible_labels = eligible_labels[eligible_labels > 0]
+    if not eligible_labels.size:
+        return []
+
+    height, width = mask.shape
+    min_x = np.full(count, width, dtype=np.intp)
+    max_x = np.full(count, -1, dtype=np.intp)
+    min_y = np.full(count, height, dtype=np.intp)
+    max_y = np.full(count, -1, dtype=np.intp)
+    np.minimum.at(min_x, pixel_labels, xs)
+    np.maximum.at(max_x, pixel_labels, xs)
+    np.minimum.at(min_y, pixel_labels, ys)
+    np.maximum.at(max_y, pixel_labels, ys)
+
+    return [
+        DifferenceRegion(
+            (
+                int(min_x[label]),
+                int(min_y[label]),
+                int(max_x[label] - min_x[label] + 1),
+                int(max_y[label] - min_y[label] + 1),
+            ),
+            int(areas[label]),
+            kind,
         )
-    return regions
+        for label in eligible_labels
+    ]
 
 
 def _layer(mask: np.ndarray, bgr_color: tuple[int, int, int], alpha: int) -> np.ndarray:
@@ -662,3 +681,4 @@ def compare_pdf_pages(
         _progress(progress, stage, 0.5 + fraction * 0.5)
 
     return compare_page_images(old.bgra, new.bgra, progress=nested, **comparison_options)
+
