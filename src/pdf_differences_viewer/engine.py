@@ -41,6 +41,18 @@ class AffineWarpSettings:
     MAX_GUARDED_PIXEL_FRACTION = 0.25
 
 
+class AlignmentSettings:
+    """Conservative settings for deciding whether ECC is worth attempting."""
+
+    FAST_REJECT_SHORT_SIDE_PX = 384
+    FAST_REJECT_MIN_PHASE_SCORE = 0.20
+    FAST_REJECT_MIN_INK_IOU = 0.10
+    FAST_REJECT_MAX_ECC_SCORE = 0.20
+    FAST_REJECT_ECC_MAX_ITERATIONS = 20
+    FAST_REJECT_ECC_EPSILON = 1e-4
+    FAST_REJECT_MAX_SHIFT_FRACTION = 0.35
+
+
 class MaskDilationSettings:
     """Tuning values for grouped sparse change masks."""
 
@@ -418,6 +430,96 @@ def _ink_mask(bgr: np.ndarray, ink_threshold: int) -> np.ndarray:
     return np.where(gray < ink_threshold, 255, 0).astype(np.uint8)
 
 
+def _coarse_gray(image: np.ndarray) -> np.ndarray:
+    """Reduce a grayscale page for a cheap alignment-confidence check."""
+    height, width = image.shape
+    scale = min(1.0, AlignmentSettings.FAST_REJECT_SHORT_SIDE_PX / min(height, width))
+    if scale == 1.0:
+        return image
+    target_width = max(1, round(width * scale))
+    target_height = max(1, round(height * scale))
+    return np.asarray(
+        Image.fromarray(image).resize((target_width, target_height), resample=Image.Resampling.BOX)
+    )
+
+
+def _coarse_ink_iou(
+    old_gray: np.ndarray,
+    new_gray: np.ndarray,
+    shift: tuple[float, float],
+    ink_threshold: int,
+) -> float:
+    """Return raw ink IoU after phase's destination-to-source translation."""
+    old_ink = (old_gray < ink_threshold).astype(np.uint8)
+    new_ink = new_gray < ink_threshold
+    matrix = np.float32([[1.0, 0.0, shift[0]], [0.0, 1.0, shift[1]]])
+    old_aligned = cv2.warpAffine(
+        old_ink,
+        matrix,
+        (new_gray.shape[1], new_gray.shape[0]),
+        flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    union = np.count_nonzero((old_aligned > 0) | new_ink)
+    if not union:
+        return 1.0
+    intersection = np.count_nonzero((old_aligned > 0) & new_ink)
+    return float(intersection / union)
+
+
+def _coarse_ecc_score(
+    old_gray: np.ndarray,
+    new_gray: np.ndarray,
+    shift: tuple[float, float],
+) -> float | None:
+    """Return a cheap Euclidean ECC score, or ``None`` when it is inconclusive."""
+    matrix = np.float32([[1.0, 0.0, shift[0]], [0.0, 1.0, shift[1]]])
+    try:
+        score, _ = cv2.findTransformECC(
+            new_gray.astype(np.float32) / 255.0,
+            old_gray.astype(np.float32) / 255.0,
+            matrix,
+            cv2.MOTION_EUCLIDEAN,
+            (
+                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                AlignmentSettings.FAST_REJECT_ECC_MAX_ITERATIONS,
+                AlignmentSettings.FAST_REJECT_ECC_EPSILON,
+            ),
+        )
+    except cv2.error:
+        return None
+    return float(score) if np.isfinite(score) else None
+
+
+def _should_fast_reject_ecc(old_gray: np.ndarray, new_gray: np.ndarray, ink_threshold: int) -> bool:
+    """Return true only when three coarse signals strongly reject alignment.
+
+    This gate never supplies a transform.  When it is inconclusive, the
+    existing full-resolution phase/ECC sequence remains exactly unchanged.
+    """
+    coarse_old = _coarse_gray(old_gray)
+    coarse_new = _coarse_gray(new_gray)
+    try:
+        shift, phase_score = cv2.phaseCorrelate(
+            coarse_new.astype(np.float32), coarse_old.astype(np.float32)
+        )
+    except cv2.error:
+        return False
+    max_shift = max(coarse_new.shape) * AlignmentSettings.FAST_REJECT_MAX_SHIFT_FRACTION
+    phase_is_plausible = (
+        np.isfinite(phase_score)
+        and phase_score >= AlignmentSettings.FAST_REJECT_MIN_PHASE_SCORE
+        and np.hypot(*shift) <= max_shift
+    )
+    if phase_is_plausible:
+        return False
+    if _coarse_ink_iou(coarse_old, coarse_new, shift, ink_threshold) >= AlignmentSettings.FAST_REJECT_MIN_INK_IOU:
+        return False
+    coarse_score = _coarse_ecc_score(coarse_old, coarse_new, shift)
+    return coarse_score is not None and coarse_score < AlignmentSettings.FAST_REJECT_MAX_ECC_SCORE
+
+
 def _align_old_to_new(
     old_bgr: np.ndarray,
     new_bgr: np.ndarray,
@@ -433,6 +535,13 @@ def _align_old_to_new(
     # ECC is deterministic and particularly effective for scanned/printed pages.
     if old_gray.std() < 1.0 or new_gray.std() < 1.0:
         return resized, AlignmentMetadata(**{**base.__dict__, "message": "blank or near-uniform page; resize only"})
+    if _should_fast_reject_ecc(old_gray, new_gray, ink_threshold):
+        return resized, AlignmentMetadata(
+            **{
+                **base.__dict__,
+                "message": "fast-reject: coarse phase, ink overlap, and ECC indicate unrelated pages; resize only",
+            }
+        )
     # ECC only converges within a fairly small basin.  Phase correlation gives
     # a cheap translation estimate first, which makes ordinary scanner/page
     # offsets reliable instead of falling straight back to resize-only mode.
@@ -681,4 +790,5 @@ def compare_pdf_pages(
         _progress(progress, stage, 0.5 + fraction * 0.5)
 
     return compare_page_images(old.bgra, new.bgra, progress=nested, **comparison_options)
+
 

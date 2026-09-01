@@ -4,18 +4,22 @@ import cv2
 import pymupdf as fitz
 import numpy as np
 
+import pdf_differences_viewer.engine as engine
 from pdf_differences_viewer.colors import DifferenceColors
 from pdf_differences_viewer.engine import (
     DifferenceRegion,
+    _align_old_to_new,
     _bgr_to_bgra,
     _bgr_to_gray,
     _can_use_qt_affine_warp,
     _dilate_binary_mask,
+    _difference_mask,
     _gray_to_bgr,
     _ink_mask,
     _regions,
     _resize_bgr,
     _rgb_to_bgr,
+    _should_fast_reject_ecc,
     _warp_bgr_affine,
     _warp_bgr_affine_numpy,
     compare_page_images,
@@ -174,6 +178,93 @@ def test_page_translation_is_aligned_before_difference_detection() -> None:
     assert result.changed_pixels < 100
 
 
+def test_fast_reject_requires_low_phase_confidence_and_low_ink_overlap(monkeypatch) -> None:
+    old = _blank(96, 120)
+    new = _blank(96, 120)
+    old[12:36, 12:36] = 0
+    new[58:82, 82:106] = 0
+
+    monkeypatch.setattr(engine.cv2, "phaseCorrelate", lambda *_args: ((0.0, 0.0), 0.0))
+    monkeypatch.setattr(engine.cv2, "findTransformECC", lambda *_args: (0.1, np.eye(2, 3, dtype=np.float32)))
+    assert _should_fast_reject_ecc(_bgr_to_gray(old), _bgr_to_gray(new), 245)
+
+    # Low phase confidence alone is not enough: matching ink remains eligible
+    # for the unchanged full-resolution ECC path.
+    assert not _should_fast_reject_ecc(_bgr_to_gray(old), _bgr_to_gray(old), 245)
+
+
+def test_fast_reject_defers_when_coarse_ecc_finds_a_plausible_alignment(monkeypatch) -> None:
+    old = _blank(96, 120)
+    new = _blank(96, 120)
+    old[12:36, 12:36] = 0
+    new[58:82, 82:106] = 0
+    monkeypatch.setattr(engine.cv2, "phaseCorrelate", lambda *_args: ((0.0, 0.0), 0.0))
+    monkeypatch.setattr(engine.cv2, "findTransformECC", lambda *_args: (0.95, np.eye(2, 3, dtype=np.float32)))
+
+    assert not _should_fast_reject_ecc(_bgr_to_gray(old), _bgr_to_gray(new), 245)
+
+
+def test_fast_reject_defers_when_coarse_ecc_is_inconclusive(monkeypatch) -> None:
+    old = _blank(96, 120)
+    new = _blank(96, 120)
+    old[12:36, 12:36] = 0
+    new[58:82, 82:106] = 0
+    monkeypatch.setattr(engine.cv2, "phaseCorrelate", lambda *_args: ((0.0, 0.0), 0.0))
+
+    def failed_ecc(*_args):
+        raise cv2.error("coarse alignment was inconclusive")
+
+    monkeypatch.setattr(engine.cv2, "findTransformECC", failed_ecc)
+    assert not _should_fast_reject_ecc(_bgr_to_gray(old), _bgr_to_gray(new), 245)
+
+
+def test_fast_reject_skips_ecc_and_preserves_resize_only_regions(monkeypatch) -> None:
+    old = _blank(480, 600)
+    new = _blank(480, 600)
+    old[60:180, 60:180] = 0
+    new[290:410, 410:530] = 0
+    monkeypatch.setattr(engine.cv2, "phaseCorrelate", lambda *_args: ((0.0, 0.0), 0.0))
+    ecc_shapes: list[tuple[int, int]] = []
+
+    def low_score_coarse_ecc(template, *_args):
+        ecc_shapes.append(template.shape)
+        return 0.1, np.eye(2, 3, dtype=np.float32)
+
+    monkeypatch.setattr(engine.cv2, "findTransformECC", low_score_coarse_ecc)
+    aligned, metadata = _align_old_to_new(old, new)
+    np.testing.assert_array_equal(aligned, _resize_bgr(old, new.shape[1], new.shape[0]))
+    assert metadata.method == "resize"
+    assert metadata.message.startswith("fast-reject:")
+    assert ecc_shapes == [(384, 480)]
+
+    result = compare_page_images(old, new, tolerance_px=0)
+    old_ink, new_ink = _ink_mask(old, 245), _ink_mask(new, 245)
+    expected_added = _difference_mask(new_ink, old_ink, 0)
+    expected_removed = _difference_mask(old_ink, new_ink, 0)
+    np.testing.assert_array_equal(result.added_mask, expected_added)
+    np.testing.assert_array_equal(result.removed_mask, expected_removed)
+    assert result.added_regions == _regions(expected_added, "added", 4, 20)
+    assert result.removed_regions == _regions(expected_removed, "removed", 4, 20)
+    assert ecc_shapes == [(384, 480), (384, 480)]
+
+
+def test_fast_reject_defers_to_full_ecc_when_phase_is_plausible(monkeypatch) -> None:
+    old = _blank(96, 120)
+    old[12:36, 12:36] = 0
+    calls = 0
+    monkeypatch.setattr(engine.cv2, "phaseCorrelate", lambda *_args: ((0.0, 0.0), 1.0))
+
+    def successful_ecc(*_args):
+        nonlocal calls
+        calls += 1
+        return 0.95, np.eye(2, 3, dtype=np.float32)
+
+    monkeypatch.setattr(engine.cv2, "findTransformECC", successful_ecc)
+    _aligned, metadata = _align_old_to_new(old, old)
+    assert calls == 1
+    assert metadata.method == "ecc-euclidean"
+
+
 def test_nearby_changed_marks_are_grouped_for_review() -> None:
     old = _blank()
     new = _blank()
@@ -270,4 +361,5 @@ def test_pdf_pages_render_and_compare(tmp_path) -> None:
     assert rendered.width > 0 and rendered.height > 0
     assert rendered.bgra.shape[2] == 4
     assert result.added_pixels > 0
+
 
