@@ -12,6 +12,7 @@ from pdf_differences_viewer.engine import (
     _bgr_to_bgra,
     _bgr_to_gray,
     _can_use_qt_affine_warp,
+    _connected_components_8,
     _dilate_binary_mask,
     _difference_mask,
     _gray_to_bgr,
@@ -298,6 +299,53 @@ def _legacy_regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distan
     return regions
 
 
+def _canonical_component_labels(labels: np.ndarray) -> np.ndarray:
+    """Normalize label numbers by first row-major occurrence for comparison."""
+    foreground_labels = labels[labels > 0]
+    if not foreground_labels.size:
+        return labels
+    unique_labels, first_indices = np.unique(foreground_labels, return_index=True)
+    ordered_labels = unique_labels[np.argsort(first_indices)]
+    mapping = np.zeros(int(unique_labels.max()) + 1, dtype=np.int32)
+    mapping[ordered_labels] = np.arange(1, ordered_labels.size + 1, dtype=np.int32)
+    return mapping[labels]
+
+
+def _region_order(region: DifferenceRegion) -> tuple[int, int, int, int, int]:
+    x, y, width, height = region.bbox
+    return y, x, height, width, region.area
+
+
+def test_numpy_connected_components_matches_opencv_8_connectivity() -> None:
+    masks = [
+        np.zeros((5, 7), dtype=np.uint8),
+        np.array(
+            [
+                [255, 0, 0, 0, 255],
+                [0, 255, 0, 255, 0],
+                [0, 0, 255, 0, 0],
+                [0, 0, 0, 0, 0],
+            ],
+            dtype=np.uint8,
+        ),
+        np.full((9, 11), 255, dtype=np.uint8),
+    ]
+    rng = np.random.default_rng(23)
+    masks.extend(
+        np.where(rng.random((height, width)) < probability, 17, 0).astype(np.uint8)
+        for height, width, probability in ((3, 4, 0.4), (19, 23, 0.1), (29, 31, 0.7))
+    )
+
+    for mask in masks:
+        expected_count, expected_labels = cv2.connectedComponents(mask, connectivity=8)
+        actual_count, actual_labels = _connected_components_8(mask)
+        assert actual_count == expected_count
+        np.testing.assert_array_equal(
+            _canonical_component_labels(actual_labels),
+            _canonical_component_labels(expected_labels),
+        )
+
+
 def test_regions_vectorized_aggregation_preserves_legacy_results() -> None:
     mask = np.zeros((20, 30), dtype=np.uint8)
     mask[2:4, 3:6] = 255       # area 6, first in component-label order
@@ -309,7 +357,24 @@ def test_regions_vectorized_aggregation_preserves_legacy_results() -> None:
         for minimum_area in (1, 4, 7):
             for merge_distance in (0, 2, 5):
                 expected = _legacy_regions(mask, kind, minimum_area, merge_distance)
-                assert _regions(mask, kind, minimum_area, merge_distance) == expected
+                assert _regions(mask, kind, minimum_area, merge_distance) == sorted(
+                    expected,
+                    key=_region_order,
+                )
+
+
+def test_regions_without_opencv_components_match_randomized_legacy_results() -> None:
+    rng = np.random.default_rng(29)
+    for height, width, probability in ((19, 23, 0.06), (31, 37, 0.2), (43, 47, 0.6)):
+        mask = np.where(rng.random((height, width)) < probability, 255, 0).astype(np.uint8)
+        for minimum_area in (1, 4, 7):
+            for merge_distance in (0, 2, 5):
+                expected = _legacy_regions(mask, "added", minimum_area, merge_distance)
+                actual = _regions(mask, "added", minimum_area, merge_distance)
+                # OpenCV's default Spaghetti implementation does not promise
+                # row-major label IDs; component membership and region geometry
+                # are the observable behavior being preserved here.
+                assert actual == sorted(expected, key=_region_order)
 
 
 def test_binary_mask_dilation_matches_opencv_rectangular_kernels() -> None:
