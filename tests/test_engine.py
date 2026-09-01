@@ -6,12 +6,14 @@ import numpy as np
 
 from pdf_differences_viewer.colors import DifferenceColors
 from pdf_differences_viewer.engine import (
+    DifferenceRegion,
     _bgr_to_bgra,
     _bgr_to_gray,
     _can_use_qt_affine_warp,
     _dilate_binary_mask,
     _gray_to_bgr,
     _ink_mask,
+    _regions,
     _resize_bgr,
     _rgb_to_bgr,
     _warp_bgr_affine,
@@ -184,6 +186,41 @@ def test_nearby_changed_marks_are_grouped_for_review() -> None:
     assert result.added_regions[0].area > 0
 
 
+def _legacy_regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distance: int) -> list[DifferenceRegion]:
+    """The pre-vectorization implementation retained as a test oracle."""
+    grouped = _dilate_binary_mask(mask, merge_distance) if merge_distance else mask
+    count, labels = cv2.connectedComponents(grouped, connectivity=8)
+    regions: list[DifferenceRegion] = []
+    for label in range(1, count):
+        in_group = (labels == label) & (mask > 0)
+        area = int(np.count_nonzero(in_group))
+        if area < minimum_area:
+            continue
+        ys, xs = np.nonzero(in_group)
+        regions.append(
+            DifferenceRegion(
+                (int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)),
+                area,
+                kind,
+            )
+        )
+    return regions
+
+
+def test_regions_vectorized_aggregation_preserves_legacy_results() -> None:
+    mask = np.zeros((20, 30), dtype=np.uint8)
+    mask[2:4, 3:6] = 255       # area 6, first in component-label order
+    mask[3:5, 9:11] = 255      # area 4, merges with the first at distance 5
+    mask[12:15, 20:22] = 255   # area 6, remains separate
+    mask[17, 1] = 255          # filtered when the minimum area is 4
+
+    for kind in ("added", "removed"):
+        for minimum_area in (1, 4, 7):
+            for merge_distance in (0, 2, 5):
+                expected = _legacy_regions(mask, kind, minimum_area, merge_distance)
+                assert _regions(mask, kind, minimum_area, merge_distance) == expected
+
+
 def test_binary_mask_dilation_matches_opencv_rectangular_kernels() -> None:
     rng = np.random.default_rng(7)
     mask = np.where(rng.random((23, 31)) > 0.88, 255, 0).astype(np.uint8)
@@ -233,3 +270,4 @@ def test_pdf_pages_render_and_compare(tmp_path) -> None:
     assert rendered.width > 0 and rendered.height > 0
     assert rendered.bgra.shape[2] == 4
     assert result.added_pixels > 0
+
