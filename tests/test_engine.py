@@ -13,6 +13,7 @@ from pdf_differences_viewer.engine import (
     _bgr_to_gray,
     _can_use_qt_affine_warp,
     _connected_components_8,
+    _distance_transform_l2_mask3,
     _dilate_binary_mask,
     _difference_mask,
     _gray_to_bgr,
@@ -150,6 +151,46 @@ def test_new_and_removed_ink_become_colored_layers() -> None:
     # OpenCV BGRA: additions are bright blue and removals are bright red.
     assert np.any(np.all(result.added_layer[:, :, :3] == DifferenceColors.ADDITION_BGR, axis=2))
     assert np.any(np.all(result.removed_layer[:, :, :3] == DifferenceColors.REMOVAL_BGR, axis=2))
+
+
+def test_numpy_distance_transform_matches_opencv_l2_mask3() -> None:
+    masks = [
+        np.zeros((5, 7), dtype=np.uint8),
+        np.full((5, 7), 255, dtype=np.uint8),
+        np.array(
+            [
+                [0, 255, 255, 255, 255],
+                [255, 255, 255, 255, 255],
+                [255, 255, 255, 255, 255],
+                [255, 255, 255, 255, 255],
+            ],
+            dtype=np.uint8,
+        ),
+    ]
+    rng = np.random.default_rng(19)
+    masks.extend(
+        np.where(rng.random((height, width)) < probability, 255, 0).astype(np.uint8)
+        for height, width, probability in ((3, 4, 0.2), (19, 23, 0.5), (29, 31, 0.9))
+    )
+
+    for mask in masks:
+        expected = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
+        actual = _distance_transform_l2_mask3(mask)
+        # OpenCV's IPP and portable paths use different internal arithmetic,
+        # so their raw float values can differ by a few ULPs. The tolerance
+        # UI uses whole pixels; this keeps the compatible 3x3 weights close
+        # while the next test proves all selectable decisions are identical.
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-4)
+
+
+def test_numpy_distance_transform_preserves_tolerance_masks() -> None:
+    rng = np.random.default_rng(31)
+    source = np.where(rng.random((29, 31)) < 0.22, 255, 0).astype(np.uint8)
+    reference = np.where(rng.random((29, 31)) < 0.18, 255, 0).astype(np.uint8)
+    for tolerance in range(21):
+        distance = cv2.distanceTransform(cv2.bitwise_not(reference), cv2.DIST_L2, 3)
+        expected = np.where((source > 0) & (distance > tolerance), 255, 0).astype(np.uint8)
+        np.testing.assert_array_equal(_difference_mask(source, reference, tolerance), expected)
 
 
 def test_old_page_is_resized_to_new_page_dimensions() -> None:
