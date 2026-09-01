@@ -670,6 +670,121 @@ def _dilate_binary_mask_integral(mask: np.ndarray, kernel_size: int) -> np.ndarr
     return np.where(window_sums > 0, 255, 0).astype(np.uint8)
 
 
+def _foreground_runs(row: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return inclusive start/end columns of a boolean row's foreground runs."""
+    columns = np.flatnonzero(row)
+    if not columns.size:
+        return columns, columns
+    split_indices = np.flatnonzero(np.diff(columns) > 1) + 1
+    return (
+        np.concatenate((columns[:1], columns[split_indices])),
+        np.concatenate((columns[split_indices - 1], columns[-1:])),
+    )
+
+
+def _connected_components_8(mask: np.ndarray) -> tuple[int, np.ndarray]:
+    """Label nonzero pixels with 8-connectivity without OpenCV.
+
+    This run-length union-find implementation avoids a Python loop for every
+    foreground pixel. Runs in adjacent rows connect when their intervals touch
+    or overlap after expanding either interval by one column, which includes
+    the diagonal neighbors required by 8-connectivity.
+    """
+    foreground = np.ascontiguousarray(mask > 0)
+    height, width = foreground.shape
+    if not np.any(foreground):
+        return 1, np.zeros((height, width), dtype=np.int32)
+
+    parents = [0]
+
+    def find(label: int) -> int:
+        while parents[label] != label:
+            parents[label] = parents[parents[label]]
+            label = parents[label]
+        return label
+
+    def union(first: int, second: int) -> int:
+        first_root, second_root = find(first), find(second)
+        if first_root == second_root:
+            return first_root
+        # Keeping the earliest provisional label as root makes final component
+        # order deterministic and compatible with raster-order region output.
+        if first_root < second_root:
+            parents[second_root] = first_root
+            return first_root
+        parents[first_root] = second_root
+        return second_root
+
+    empty = np.empty(0, dtype=np.intp)
+    previous_starts = previous_ends = previous_labels = empty
+    next_label = 1
+    for row in foreground:
+        starts, ends = _foreground_runs(row)
+        current_labels = np.empty(starts.size, dtype=np.int32)
+        previous_index = 0
+        for index, (start, end) in enumerate(zip(starts, ends)):
+            while (
+                previous_index < previous_starts.size
+                and previous_ends[previous_index] < start - 1
+            ):
+                previous_index += 1
+
+            candidate_index = previous_index
+            label = 0
+            while (
+                candidate_index < previous_starts.size
+                and previous_starts[candidate_index] <= end + 1
+            ):
+                candidate_label = int(previous_labels[candidate_index])
+                label = candidate_label if label == 0 else union(label, candidate_label)
+                candidate_index += 1
+
+            if label == 0:
+                label = next_label
+                parents.append(label)
+                next_label += 1
+            current_labels[index] = find(label)
+
+        previous_starts, previous_ends, previous_labels = starts, ends, current_labels
+
+    roots = np.arange(next_label, dtype=np.int32)
+    for label in range(1, next_label):
+        roots[label] = find(label)
+    component_roots = np.unique(roots[1:])
+    compact_labels = np.zeros(next_label, dtype=np.int32)
+    compact_labels[component_roots] = np.arange(1, component_roots.size + 1, dtype=np.int32)
+
+    # Scan a second time so the dense label image can be built without storing
+    # every run from the first pass. New provisional labels are created in the
+    # same row-major order, then mapped to their final union-find component.
+    labels = np.zeros((height, width), dtype=np.int32)
+    previous_starts = previous_ends = previous_labels = empty
+    next_label = 1
+    for row_index, row in enumerate(foreground):
+        starts, ends = _foreground_runs(row)
+        current_labels = np.empty(starts.size, dtype=np.int32)
+        previous_index = 0
+        for index, (start, end) in enumerate(zip(starts, ends)):
+            while (
+                previous_index < previous_starts.size
+                and previous_ends[previous_index] < start - 1
+            ):
+                previous_index += 1
+            if (
+                previous_index < previous_starts.size
+                and previous_starts[previous_index] <= end + 1
+            ):
+                label = int(previous_labels[previous_index])
+            else:
+                label = next_label
+                next_label += 1
+            current_labels[index] = label
+            labels[row_index, start : end + 1] = compact_labels[roots[label]]
+        previous_starts, previous_ends, previous_labels = starts, ends, current_labels
+
+    return int(component_roots.size + 1), labels
+
+
 def _regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distance: int) -> list[DifferenceRegion]:
     """Group nearby ink changes into reviewable regions without inflating area.
 
@@ -677,6 +792,8 @@ def _regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distance: int
     Connected-components on the raw mask would present every character as a
     separate sidebar row.  Components are therefore found on a lightly dilated
     copy, while the returned bounds and area still come from the original mask.
+    Regions are returned in stable top-to-bottom, left-to-right order instead
+    of depending on a particular labeling backend's internal ID order.
     """
     if not np.any(mask):
         return []
@@ -684,7 +801,7 @@ def _regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distance: int
         grouped = _dilate_binary_mask(mask, merge_distance)
     else:
         grouped = mask
-    count, labels = cv2.connectedComponents(grouped, connectivity=8)
+    count, labels = _connected_components_8(grouped)
     # Work only with changed pixels once.  The former implementation compared
     # every page pixel against every component label, which becomes especially
     # expensive at high DPI when a page has many regions.
@@ -706,7 +823,7 @@ def _regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distance: int
     np.minimum.at(min_y, pixel_labels, ys)
     np.maximum.at(max_y, pixel_labels, ys)
 
-    return [
+    regions = [
         DifferenceRegion(
             (
                 int(min_x[label]),
@@ -719,6 +836,16 @@ def _regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distance: int
         )
         for label in eligible_labels
     ]
+    return sorted(
+        regions,
+        key=lambda region: (
+            region.bbox[1],
+            region.bbox[0],
+            region.bbox[3],
+            region.bbox[2],
+            region.area,
+        ),
+    )
 
 
 def _layer(mask: np.ndarray, bgr_color: tuple[int, int, int], alpha: int) -> np.ndarray:
