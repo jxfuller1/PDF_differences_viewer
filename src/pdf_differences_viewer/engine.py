@@ -8,6 +8,7 @@ small rasterisation shifts therefore do not become differences.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from math import asin, atan2, cos, degrees, hypot, sin
 from pathlib import Path
@@ -662,7 +663,7 @@ def _central_gradients(image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return gradient_x, gradient_y
 
 
-def _warp_ecc_channels(
+def _warp_ecc_channels_numpy(
     padded_channels: np.ndarray,
     source_shape: tuple[int, int],
     matrix: np.ndarray,
@@ -710,6 +711,202 @@ def _warp_ecc_channels(
     return top, valid
 
 
+def _ecc_pillow_affine(matrix: np.ndarray) -> tuple[float, ...]:
+    """Return Pillow inverse-map coefficients for pixel-centered ECC coordinates."""
+    a, b, translate_x = (float(value) for value in matrix[0])
+    c, d, translate_y = (float(value) for value in matrix[1])
+    # Pillow evaluates its affine map at the center of each destination pixel,
+    # then its bilinear sampler subtracts half a pixel. This offset keeps the
+    # effective source coordinate equal to M @ [x, y, 1], as used by NumPy.
+    return (
+        a,
+        b,
+        translate_x + 0.5 - 0.5 * (a + b),
+        c,
+        d,
+        translate_y + 0.5 - 0.5 * (c + d),
+    )
+
+
+def _prepare_ecc_channel_images(
+    padded_channels: np.ndarray,
+) -> tuple[Image.Image, ...]:
+    """Copy the three ECC channels into reusable Pillow float images."""
+    channels = padded_channels[1:-1, 1:-1]
+    return tuple(
+        Image.fromarray(np.ascontiguousarray(channels[:, :, index]))
+        for index in range(channels.shape[2])
+    )
+
+
+def _warp_ecc_channels_pillow(
+    padded_channels: np.ndarray,
+    source_shape: tuple[int, int],
+    matrix: np.ndarray,
+    destination_x: np.ndarray,
+    destination_y: np.ndarray,
+    source_images: tuple[Image.Image, ...],
+    executor: ThreadPoolExecutor | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Warp ECC channels in Pillow's compiled sampler, repairing its borders."""
+    source_height, source_width = source_shape
+    destination_height = destination_y.shape[0]
+    destination_width = destination_x.shape[1]
+    affine = _ecc_pillow_affine(matrix)
+
+    def transform(image: Image.Image) -> Image.Image:
+        return image.transform(
+            (destination_width, destination_height),
+            Image.Transform.AFFINE,
+            affine,
+            resample=Image.Resampling.BILINEAR,
+            fillcolor=0.0,
+        )
+
+    if executor is None:
+        transformed = tuple(transform(image) for image in source_images)
+    else:
+        transformed = tuple(executor.map(transform, source_images))
+    warped = np.stack(tuple(np.asarray(image) for image in transformed), axis=2)
+
+    # Preserve the original nearest-coordinate validity rule exactly. Pillow's
+    # nearest filter differs at a few half-pixel ties.
+    source_x = (
+        matrix[0, 0] * destination_x
+        + matrix[0, 1] * destination_y
+        + matrix[0, 2]
+    )
+    source_y = (
+        matrix[1, 0] * destination_x
+        + matrix[1, 1] * destination_y
+        + matrix[1, 2]
+    )
+    nearest_x = np.rint(source_x)
+    nearest_y = np.rint(source_y)
+    valid = (
+        (nearest_x >= 0)
+        & (nearest_x < source_width)
+        & (nearest_y >= 0)
+        & (nearest_y < source_height)
+    )
+
+    # Pillow extends edge pixels during bilinear sampling, while ECC uses a
+    # zero-valued constant border. Only the narrow valid perimeter can observe
+    # that difference, so resample those pixels with the original arithmetic.
+    edge = valid & (
+        (source_x < 0)
+        | (source_x > source_width - 1)
+        | (source_y < 0)
+        | (source_y > source_height - 1)
+    )
+    edge_y, edge_x = np.nonzero(edge)
+    if edge_x.size:
+        sample_x = source_x[edge_y, edge_x]
+        sample_y = source_y[edge_y, edge_x]
+        left_x = np.floor(sample_x).astype(np.int32)
+        top_y = np.floor(sample_y).astype(np.int32)
+        fraction_x = sample_x - left_x
+        fraction_y = sample_y - top_y
+        left_index = np.clip(left_x, -1, source_width) + 1
+        right_index = np.clip(left_x + 1, -1, source_width) + 1
+        top_index = np.clip(top_y, -1, source_height) + 1
+        bottom_index = np.clip(top_y + 1, -1, source_height) + 1
+
+        top = padded_channels[top_index, left_index].copy()
+        top *= (1.0 - fraction_x)[:, np.newaxis]
+        top += padded_channels[top_index, right_index] * fraction_x[:, np.newaxis]
+        bottom = padded_channels[bottom_index, left_index].copy()
+        bottom *= (1.0 - fraction_x)[:, np.newaxis]
+        bottom += padded_channels[bottom_index, right_index] * fraction_x[:, np.newaxis]
+        top *= (1.0 - fraction_y)[:, np.newaxis]
+        top += bottom * fraction_y[:, np.newaxis]
+        warped[edge_y, edge_x] = top
+    return warped, valid
+
+
+class _EccChannelWarper:
+    """Reuse Pillow inputs and permanently fall back after an accelerator error."""
+
+    def __init__(
+        self,
+        padded_channels: np.ndarray,
+        source_shape: tuple[int, int],
+        destination_x: np.ndarray,
+        destination_y: np.ndarray,
+    ) -> None:
+        self._padded_channels = padded_channels
+        self._source_shape = source_shape
+        self._destination_x = destination_x
+        self._destination_y = destination_y
+        self._source_images: tuple[Image.Image, ...] | None = None
+        self._executor: ThreadPoolExecutor | None = None
+        try:
+            self._source_images = _prepare_ecc_channel_images(padded_channels)
+            # Pillow's compiled transforms release the GIL. The independent
+            # intensity/x-gradient/y-gradient warps can therefore run together.
+            self._executor = ThreadPoolExecutor(
+                max_workers=len(self._source_images),
+                thread_name_prefix="pdf-ecc-warp",
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            self._source_images = None
+            self._executor = None
+
+    def __enter__(self) -> _EccChannelWarper:
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown()
+            self._executor = None
+
+    def _disable_accelerator(self) -> None:
+        self.close()
+        self._source_images = None
+
+    def warp(self, matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if self._source_images is not None:
+            try:
+                return _warp_ecc_channels_pillow(
+                    self._padded_channels,
+                    self._source_shape,
+                    matrix,
+                    self._destination_x,
+                    self._destination_y,
+                    self._source_images,
+                    self._executor,
+                )
+            except (OSError, RuntimeError, ValueError):
+                self._disable_accelerator()
+        return _warp_ecc_channels_numpy(
+            self._padded_channels,
+            self._source_shape,
+            matrix,
+            self._destination_x,
+            self._destination_y,
+        )
+
+
+def _warp_ecc_channels(
+    padded_channels: np.ndarray,
+    source_shape: tuple[int, int],
+    matrix: np.ndarray,
+    destination_x: np.ndarray,
+    destination_y: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Inverse-sample ECC channels through Pillow, with an exact NumPy fallback."""
+    with _EccChannelWarper(
+        padded_channels,
+        source_shape,
+        destination_x,
+        destination_y,
+    ) as warper:
+        return warper.warp(matrix)
+
+
 def _find_transform_ecc_euclidean_core(
     template: np.ndarray,
     input_image: np.ndarray,
@@ -732,89 +929,96 @@ def _find_transform_ecc_euclidean_core(
     destination_y = np.arange(height, dtype=np.float32)[:, np.newaxis]
     matrix = np.asarray(initial_matrix, dtype=np.float32).reshape(2, 3).copy()
     rho = -1.0
+    with _EccChannelWarper(
+        padded_channels,
+        input_blurred.shape,
+        destination_x,
+        destination_y,
+    ) as warper:
+        for _ in range(max_iterations):
+            last_rho = rho
+            warped, valid = warper.warp(matrix)
+            valid_y, valid_x = np.nonzero(valid)
+            if valid_x.size < EccSettings.MIN_VALID_PIXELS:
+                raise EccConvergenceError("ECC has too little overlapping image area")
 
-    for _ in range(max_iterations):
-        last_rho = rho
-        warped, valid = _warp_ecc_channels(
-            padded_channels,
-            input_blurred.shape,
-            matrix,
-            destination_x,
-            destination_y,
-        )
-        valid_y, valid_x = np.nonzero(valid)
-        if valid_x.size < EccSettings.MIN_VALID_PIXELS:
-            raise EccConvergenceError("ECC has too little overlapping image area")
+            template_values = template_blurred[valid_y, valid_x]
+            input_values = warped[valid_y, valid_x, 0]
+            template_zero_mean = template_values - np.mean(
+                template_values,
+                dtype=np.float64,
+            )
+            input_zero_mean = input_values - np.mean(
+                input_values,
+                dtype=np.float64,
+            )
+            template_norm_squared = float(
+                np.sum(template_zero_mean * template_zero_mean, dtype=np.float64)
+            )
+            input_norm_squared = float(
+                np.sum(input_zero_mean * input_zero_mean, dtype=np.float64)
+            )
+            if template_norm_squared <= 0.0 or input_norm_squared <= 0.0:
+                raise EccConvergenceError("ECC cannot align a uniform image")
+            correlation = float(
+                np.sum(template_zero_mean * input_zero_mean, dtype=np.float64)
+            )
+            rho = correlation / np.sqrt(template_norm_squared * input_norm_squared)
+            if not np.isfinite(rho):
+                raise EccConvergenceError("ECC correlation became non-finite")
 
-        template_values = template_blurred[valid_y, valid_x]
-        input_values = warped[valid_y, valid_x, 0]
-        template_zero_mean = template_values - np.mean(template_values, dtype=np.float64)
-        input_zero_mean = input_values - np.mean(input_values, dtype=np.float64)
-        template_norm_squared = float(
-            np.sum(template_zero_mean * template_zero_mean, dtype=np.float64)
-        )
-        input_norm_squared = float(
-            np.sum(input_zero_mean * input_zero_mean, dtype=np.float64)
-        )
-        if template_norm_squared <= 0.0 or input_norm_squared <= 0.0:
-            raise EccConvergenceError("ECC cannot align a uniform image")
-        correlation = float(
-            np.sum(template_zero_mean * input_zero_mean, dtype=np.float64)
-        )
-        rho = correlation / np.sqrt(template_norm_squared * input_norm_squared)
-        if not np.isfinite(rho):
-            raise EccConvergenceError("ECC correlation became non-finite")
+            angle = asin(float(np.clip(matrix[1, 0], -1.0, 1.0)))
+            sine = np.float32(sin(angle))
+            cosine = np.float32(cos(angle))
+            x_coordinates = valid_x.astype(np.float32, copy=False)
+            y_coordinates = valid_y.astype(np.float32, copy=False)
+            warped_gradient_x = warped[valid_y, valid_x, 1]
+            warped_gradient_y = warped[valid_y, valid_x, 2]
+            jacobian = np.empty((valid_x.size, 3), dtype=np.float32)
+            jacobian[:, 0] = warped_gradient_x * (
+                -sine * x_coordinates - cosine * y_coordinates
+            ) + warped_gradient_y * (
+                cosine * x_coordinates - sine * y_coordinates
+            )
+            jacobian[:, 1] = warped_gradient_x
+            jacobian[:, 2] = warped_gradient_y
 
-        angle = asin(float(np.clip(matrix[1, 0], -1.0, 1.0)))
-        sine = np.float32(sin(angle))
-        cosine = np.float32(cos(angle))
-        x_coordinates = valid_x.astype(np.float32, copy=False)
-        y_coordinates = valid_y.astype(np.float32, copy=False)
-        warped_gradient_x = warped[valid_y, valid_x, 1]
-        warped_gradient_y = warped[valid_y, valid_x, 2]
-        jacobian = np.empty((valid_x.size, 3), dtype=np.float32)
-        jacobian[:, 0] = warped_gradient_x * (
-            -sine * x_coordinates - cosine * y_coordinates
-        ) + warped_gradient_y * (
-            cosine * x_coordinates - sine * y_coordinates
-        )
-        jacobian[:, 1] = warped_gradient_x
-        jacobian[:, 2] = warped_gradient_y
+            hessian = jacobian.T @ jacobian
+            image_projection = jacobian.T @ input_zero_mean
+            template_projection = jacobian.T @ template_zero_mean
+            try:
+                image_projection_hessian = np.linalg.solve(hessian, image_projection)
+            except np.linalg.LinAlgError as exc:
+                raise EccConvergenceError("ECC Hessian is singular") from exc
+            lambda_numerator = input_norm_squared - float(
+                image_projection @ image_projection_hessian
+            )
+            lambda_denominator = correlation - float(
+                template_projection @ image_projection_hessian
+            )
+            if not np.isfinite(lambda_denominator) or lambda_denominator <= 0.0:
+                raise EccConvergenceError(
+                    "ECC images are uncorrelated or non-overlapping"
+                )
+            illumination_scale = lambda_numerator / lambda_denominator
+            error = illumination_scale * template_zero_mean - input_zero_mean
+            error_projection = jacobian.T @ error
+            try:
+                delta = np.linalg.solve(hessian, error_projection)
+            except np.linalg.LinAlgError as exc:
+                raise EccConvergenceError("ECC Hessian is singular") from exc
+            if not np.isfinite(delta).all():
+                raise EccConvergenceError("ECC update became non-finite")
 
-        hessian = jacobian.T @ jacobian
-        image_projection = jacobian.T @ input_zero_mean
-        template_projection = jacobian.T @ template_zero_mean
-        try:
-            image_projection_hessian = np.linalg.solve(hessian, image_projection)
-        except np.linalg.LinAlgError as exc:
-            raise EccConvergenceError("ECC Hessian is singular") from exc
-        lambda_numerator = input_norm_squared - float(
-            image_projection @ image_projection_hessian
-        )
-        lambda_denominator = correlation - float(
-            template_projection @ image_projection_hessian
-        )
-        if not np.isfinite(lambda_denominator) or lambda_denominator <= 0.0:
-            raise EccConvergenceError("ECC images are uncorrelated or non-overlapping")
-        illumination_scale = lambda_numerator / lambda_denominator
-        error = illumination_scale * template_zero_mean - input_zero_mean
-        error_projection = jacobian.T @ error
-        try:
-            delta = np.linalg.solve(hessian, error_projection)
-        except np.linalg.LinAlgError as exc:
-            raise EccConvergenceError("ECC Hessian is singular") from exc
-        if not np.isfinite(delta).all():
-            raise EccConvergenceError("ECC update became non-finite")
-
-        angle += float(delta[0])
-        matrix[0, 0] = cos(angle)
-        matrix[0, 1] = -sin(angle)
-        matrix[1, 0] = sin(angle)
-        matrix[1, 1] = cos(angle)
-        matrix[0, 2] += delta[1]
-        matrix[1, 2] += delta[2]
-        if abs(rho - last_rho) < epsilon:
-            break
+            angle += float(delta[0])
+            matrix[0, 0] = cos(angle)
+            matrix[0, 1] = -sin(angle)
+            matrix[1, 0] = sin(angle)
+            matrix[1, 1] = cos(angle)
+            matrix[0, 2] += delta[1]
+            matrix[1, 2] += delta[2]
+            if abs(rho - last_rho) < epsilon:
+                break
 
     return float(rho), matrix
 
