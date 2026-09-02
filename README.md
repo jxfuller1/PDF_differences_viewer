@@ -8,7 +8,7 @@ This is a rewrite inspired by [DrawingContrast](https://github.com/ayumilove/Dra
 license and attribution are reproduced in [NOTICE.md](NOTICE.md).
 
 This is rewritten to only use PyQt6, Pillow and numpy.  It removes the QtWebEngine and OpenCV dependency from the original.
-This reduces the package size quite a bit.   Overall, it's pretty comparable in speed to the original.
+This reduces the package size quite a bit.   This implementation runs faster than the original.  
 
 ![Native viewer architecture](docs/native-viewer-architecture.svg)
 
