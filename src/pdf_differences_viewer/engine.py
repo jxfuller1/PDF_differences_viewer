@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import lru_cache
 from math import asin, atan2, cos, degrees, hypot, sin
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -83,6 +84,18 @@ class DistanceTransformSettings:
 
     AXIAL_COST = np.float32(0.955)
     DIAGONAL_COST = np.float32(1.3693)
+
+
+class DifferenceMaskSettings:
+    """Dispatch limits for the exact, small-radius tolerance mask path."""
+
+    # Larger tolerance balls cost more to query than the full chamfer transform
+    # on realistic drawing pages, so they retain the existing implementation.
+    MAX_LOCAL_TOLERANCE_PX = 10
+    DIRECT_MAX_WORK_FRACTION = 0.10
+    DIRECT_SMALL_OFFSET_COUNT = 32
+    DIRECT_SMALL_OFFSET_MAX_WORK_FRACTION = 2.0
+    SPAN_MAX_WORK_FRACTION = 0.75
 
 
 class MaskDilationSettings:
@@ -1369,12 +1382,119 @@ def _distance_transform_l2_mask3(source: np.ndarray) -> np.ndarray:
     return distances
 
 
+@lru_cache(maxsize=DifferenceMaskSettings.MAX_LOCAL_TOLERANCE_PX + 1)
+def _tolerance_neighborhood(
+    tolerance_px: int,
+) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]:
+    """Return the exact local chamfer ball and its per-row spans.
+
+    The cached transform is deliberately produced by the same oracle used by
+    the fallback.  Thus this optimization only changes how the reference mask
+    is queried; it does not introduce a second approximation of OpenCV's
+    mask3 distance transform.
+    """
+    radius = int(np.ceil(tolerance_px / float(DistanceTransformSettings.AXIAL_COST))) + 2
+    size = radius * 2 + 1
+    center = radius
+    probe = np.ones((size, size), dtype=np.uint8)
+    probe[center, center] = 0
+    distances = _distance_transform_l2_mask3(probe)
+    offsets: list[tuple[int, int]] = []
+    spans: list[tuple[int, int]] = []
+    for dy in range(-radius, radius + 1):
+        valid_dx = np.flatnonzero(distances[center + dy] <= tolerance_px)
+        if valid_dx.size:
+            dx = valid_dx - center
+            offsets.extend((dy, int(value)) for value in dx)
+            spans.append((dy, int(np.max(np.abs(dx)))))
+    return tuple(offsets), tuple(spans)
+
+
+def _difference_candidates(source_ink: np.ndarray, reference_ink: np.ndarray) -> np.ndarray:
+    """Return source ink that does not overlap reference ink, without temporaries."""
+    candidates = np.empty(source_ink.shape, dtype=bool)
+    np.equal(reference_ink, 0, out=candidates)
+    np.greater(source_ink, 0, out=candidates, where=candidates)
+    return candidates
+
+
+def _difference_mask_local(
+    source_ink: np.ndarray,
+    reference_ink: np.ndarray,
+    tolerance_px: float,
+) -> np.ndarray | None:
+    """Compute small finite-radius tolerance masks without a full-page DT."""
+    if not np.isfinite(tolerance_px) or tolerance_px < 0:
+        return None
+    rounded_tolerance = int(tolerance_px)
+    if (
+        tolerance_px != rounded_tolerance
+        or rounded_tolerance > DifferenceMaskSettings.MAX_LOCAL_TOLERANCE_PX
+    ):
+        return None
+    offsets, spans = _tolerance_neighborhood(rounded_tolerance)
+    candidate_mask = _difference_candidates(source_ink, reference_ink)
+    candidate_count = int(np.count_nonzero(candidate_mask))
+    if not candidate_count:
+        return np.zeros(source_ink.shape, dtype=np.uint8)
+    page_size = source_ink.size
+    offset_count = len(offsets)
+    work = candidate_count * offset_count
+    if work <= DifferenceMaskSettings.DIRECT_MAX_WORK_FRACTION * page_size or (
+        offset_count <= DifferenceMaskSettings.DIRECT_SMALL_OFFSET_COUNT
+        and work <= DifferenceMaskSettings.DIRECT_SMALL_OFFSET_MAX_WORK_FRACTION * page_size
+    ):
+        radius = int(np.ceil(rounded_tolerance / float(DistanceTransformSettings.AXIAL_COST))) + 2
+        padded_reference = np.pad(reference_ink != 0, radius, mode="constant")
+        ys, xs = np.nonzero(candidate_mask)
+        keep = np.ones(candidate_count, dtype=bool)
+        for dy, dx in offsets:
+            keep &= ~padded_reference[ys + radius + dy, xs + radius + dx]
+    elif candidate_count * len(spans) <= DifferenceMaskSettings.SPAN_MAX_WORK_FRACTION * page_size:
+        radius = int(np.ceil(rounded_tolerance / float(DistanceTransformSettings.AXIAL_COST))) + 2
+        height, width = reference_ink.shape
+        prefix = np.zeros(
+            (height + 2 * radius, width + 1),
+            dtype=np.uint32,
+        )
+        np.cumsum(
+            reference_ink != 0,
+            axis=1,
+            dtype=np.uint32,
+            out=prefix[radius : radius + height, 1:],
+        )
+        ys, xs = np.nonzero(candidate_mask)
+        keep = np.ones(candidate_count, dtype=bool)
+        for dy, half_width in spans:
+            rows = ys + radius + dy
+            left = np.maximum(xs - half_width, 0)
+            right = np.minimum(xs + half_width + 1, width)
+            keep &= (prefix[rows, right] - prefix[rows, left]) == 0
+    else:
+        return None
+    result = np.zeros(source_ink.shape, dtype=np.uint8)
+    result[ys[keep], xs[keep]] = 255
+    return result
+
+
 def _difference_mask(source_ink: np.ndarray, reference_ink: np.ndarray, tolerance_px: float) -> np.ndarray:
     if tolerance_px == 0:
-        return np.where((source_ink > 0) & (reference_ink == 0), 255, 0).astype(np.uint8)
+        result = np.zeros(source_ink.shape, dtype=np.uint8)
+        result[_difference_candidates(source_ink, reference_ink)] = 255
+        return result
+    accelerated = _difference_mask_local(source_ink, reference_ink, tolerance_px)
+    if accelerated is not None:
+        return accelerated
     # The transform measures each source pixel's distance to reference ink.
-    distance = _distance_transform_l2_mask3(np.bitwise_not(reference_ink))
-    return np.where((source_ink > 0) & (distance > tolerance_px), 255, 0).astype(np.uint8)
+    # Normalize the reference to the binary representation expected by the
+    # distance transform; callers may use any nonzero value for ink.
+    reference_background = reference_ink == 0
+    distance = _distance_transform_l2_mask3(reference_background)
+    candidates = _difference_candidates(source_ink, reference_ink)
+    np.greater(distance, tolerance_px, out=candidates, where=candidates)
+    result = np.zeros(source_ink.shape, dtype=np.uint8)
+    result[candidates] = 255
+    return result
 
 
 def _dilate_binary_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:

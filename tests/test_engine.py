@@ -237,6 +237,71 @@ def test_numpy_distance_transform_preserves_tolerance_masks() -> None:
         np.testing.assert_array_equal(_difference_mask(source, reference, tolerance), expected)
 
 
+def test_tolerance_mask_acceleration_matches_opencv_for_all_ui_tolerances() -> None:
+    rng = np.random.default_rng(131)
+    source = (rng.random((47, 61)) < 0.15).astype(np.uint8) * 7
+    reference = (rng.random((47, 61)) < 0.12).astype(np.uint8) * 3
+    binary_reference = np.where(reference > 0, 0, 255).astype(np.uint8)
+    for tolerance in range(21):
+        expected = np.where(
+            (source > 0)
+            & (cv2.distanceTransform(binary_reference, cv2.DIST_L2, 3) > tolerance),
+            255,
+            0,
+        ).astype(np.uint8)
+        np.testing.assert_array_equal(_difference_mask(source, reference, tolerance), expected)
+
+
+def test_tolerance_mask_preserves_positive_source_ink_predicate() -> None:
+    source = np.array([[-1.0, np.nan, 0.0, 1.0]], dtype=np.float32)
+    reference = np.zeros_like(source)
+    np.testing.assert_array_equal(
+        _difference_mask(source, reference, 0),
+        np.array([[0, 0, 0, 255]], dtype=np.uint8),
+    )
+
+
+def test_tolerance_mask_dispatch_exercises_direct_span_and_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = np.zeros((80, 100), dtype=np.uint8)
+    reference = np.zeros_like(source)
+    source[10, 10] = 255
+    source[40, 50] = 255
+    reference[10, 11] = 255
+
+    direct = engine._difference_mask_local(source, reference, 2)
+    assert direct is not None
+    direct_expected = np.where(
+        (source > 0)
+        & (cv2.distanceTransform(cv2.bitwise_not(reference), cv2.DIST_L2, 3) > 2),
+        255,
+        0,
+    ).astype(np.uint8)
+    np.testing.assert_array_equal(direct, direct_expected)
+
+    rng = np.random.default_rng(197)
+    source = np.where(rng.random((37, 43)) < 0.18, 255, 0).astype(np.uint8)
+    reference = np.where(rng.random((37, 43)) < 0.14, 255, 0).astype(np.uint8)
+    expected = np.where(
+        (source > 0)
+        & (cv2.distanceTransform(cv2.bitwise_not(reference), cv2.DIST_L2, 3) > 10),
+        255,
+        0,
+    ).astype(np.uint8)
+
+    monkeypatch.setattr(engine.DifferenceMaskSettings, "DIRECT_MAX_WORK_FRACTION", 0.0)
+    monkeypatch.setattr(engine.DifferenceMaskSettings, "DIRECT_SMALL_OFFSET_MAX_WORK_FRACTION", 0.0)
+    monkeypatch.setattr(engine.DifferenceMaskSettings, "SPAN_MAX_WORK_FRACTION", 100.0)
+    span = engine._difference_mask_local(source, reference, 10)
+    assert span is not None
+    np.testing.assert_array_equal(span, expected)
+
+    monkeypatch.setattr(engine.DifferenceMaskSettings, "SPAN_MAX_WORK_FRACTION", 0.0)
+    assert engine._difference_mask_local(source, reference, 10) is None
+    np.testing.assert_array_equal(_difference_mask(source, reference, 10), expected)
+
+
 def test_numpy_phase_correlate_matches_opencv_shift_and_response() -> None:
     rng = np.random.default_rng(83)
     noisy = rng.normal(size=(99, 121)).astype(np.float32)
