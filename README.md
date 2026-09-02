@@ -1,9 +1,14 @@
 # PDF Differences Viewer
 
-A native desktop application for comparing two PDF drawing revisions. It uses
+This is native desktop application for comparing two PDF drawing revisions. It uses
 PyMuPDF, Pillow, and NumPy to rasterize, align, and classify drawing differences,
-then uses **PyQt6 `QGraphicsView`** to render the result. There is no Qt WebEngine,
-embedded browser, local web server, or browser profile.
+then uses **PyQt6 `QGraphicsView`** to render the result.
+
+This is a rewrite inspired by [DrawingContrast](https://github.com/ayumilove/DrawingContrast), whose MIT
+license and attribution are reproduced in [NOTICE.md](NOTICE.md).
+
+This is rewritten to only use PyQt6, Pillow and numpy.  It removes the QtWebEngine and OpenCV dependency from the original.
+This reduces the package size quite a bit.   However, it is slightly slower in comparison to the original that uses OpenCV.
 
 ![Native viewer architecture](docs/native-viewer-architecture.svg)
 
@@ -66,9 +71,6 @@ pip install -e ".[dev]"
 pytest
 ```
 
-## Design
-
-The application deliberately uses Qt's scene graph rather than HTML:
 
 ```text
 PDFs → NumPy/Pillow comparison → QGraphicsScene
@@ -86,8 +88,3 @@ selection native Qt interactions.
 OpenCV is not a runtime dependency. The development extra retains it only as
 an independent compatibility oracle for the image-processing tests.
 
-## Attribution
-
-This is a native-viewer rewrite inspired by
-[DrawingContrast](https://github.com/ayumilove/DrawingContrast), whose MIT
-license and attribution are reproduced in [NOTICE.md](NOTICE.md).
