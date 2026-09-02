@@ -9,11 +9,10 @@ small rasterisation shifts therefore do not become differences.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import atan2, degrees, hypot
+from math import asin, atan2, cos, degrees, hypot, sin
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-import cv2
 import pymupdf as fitz
 import numpy as np
 from PIL import Image
@@ -51,6 +50,24 @@ class AlignmentSettings:
     FAST_REJECT_ECC_MAX_ITERATIONS = 20
     FAST_REJECT_ECC_EPSILON = 1e-4
     FAST_REJECT_MAX_SHIFT_FRACTION = 0.35
+
+
+class EccSettings:
+    """OpenCV-compatible Euclidean ECC constants and memory limits."""
+
+    GAUSSIAN_KERNEL = np.array((1, 4, 6, 4, 1), dtype=np.float32) / 16.0
+    MAX_WORKING_SHORT_SIDE_PX = 768
+    MIN_VALID_PIXELS = 9
+    REFINEMENT_MIN_SOURCE_SHORT_SIDE_PX = 2048
+    REFINEMENT_SHORT_SIDE_PX = 1280
+    REFINEMENT_ITERATIONS = 2
+    REFINEMENT_MIN_ROTATION_RADIANS = 1e-4
+    REFINEMENT_MIN_PHASE_SCORE = 0.50
+    REFINEMENT_MAX_PHASE_SHIFT_PX = 2.0
+
+
+class EccConvergenceError(RuntimeError):
+    """Raised when Euclidean ECC cannot produce a trustworthy update."""
 
 
 class PhaseCorrelationSettings:
@@ -614,6 +631,353 @@ def _coarse_ink_iou(
     return float(intersection / union)
 
 
+def _gaussian_blur_5x5(image: np.ndarray) -> np.ndarray:
+    """Apply OpenCV's default 5x5, sigma-zero Gaussian to a float image."""
+    source = np.asarray(image, dtype=np.float32)
+    kernel = EccSettings.GAUSSIAN_KERNEL
+    horizontal_source = np.pad(source, ((0, 0), (2, 2)), mode="reflect")
+    horizontal = sum(
+        weight * horizontal_source[:, offset : offset + source.shape[1]]
+        for offset, weight in enumerate(kernel)
+    )
+    vertical_source = np.pad(horizontal, ((2, 2), (0, 0)), mode="reflect")
+    return np.asarray(
+        sum(
+            weight * vertical_source[offset : offset + source.shape[0]]
+            for offset, weight in enumerate(kernel)
+        ),
+        dtype=np.float32,
+    )
+
+
+def _central_gradients(image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return the source gradients used by OpenCV's ECC implementation."""
+    source = np.asarray(image, dtype=np.float32)
+    gradient_x = np.zeros_like(source)
+    gradient_y = np.zeros_like(source)
+    if source.shape[1] > 2:
+        gradient_x[:, 1:-1] = (source[:, 2:] - source[:, :-2]) * np.float32(0.5)
+    if source.shape[0] > 2:
+        gradient_y[1:-1] = (source[2:] - source[:-2]) * np.float32(0.5)
+    return gradient_x, gradient_y
+
+
+def _warp_ecc_channels(
+    padded_channels: np.ndarray,
+    source_shape: tuple[int, int],
+    matrix: np.ndarray,
+    destination_x: np.ndarray,
+    destination_y: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Inverse-sample ECC intensity/gradient channels and their valid mask."""
+    source_height, source_width = source_shape
+    source_x = (
+        matrix[0, 0] * destination_x
+        + matrix[0, 1] * destination_y
+        + matrix[0, 2]
+    )
+    source_y = (
+        matrix[1, 0] * destination_x
+        + matrix[1, 1] * destination_y
+        + matrix[1, 2]
+    )
+    nearest_x = np.rint(source_x)
+    nearest_y = np.rint(source_y)
+    valid = (
+        (nearest_x >= 0)
+        & (nearest_x < source_width)
+        & (nearest_y >= 0)
+        & (nearest_y < source_height)
+    )
+
+    left_x = np.floor(source_x).astype(np.int32)
+    top_y = np.floor(source_y).astype(np.int32)
+    fraction_x = source_x - left_x
+    fraction_y = source_y - top_y
+    left_index = np.clip(left_x, -1, source_width) + 1
+    right_index = np.clip(left_x + 1, -1, source_width) + 1
+    top_index = np.clip(top_y, -1, source_height) + 1
+    bottom_index = np.clip(top_y + 1, -1, source_height) + 1
+
+    top = padded_channels[top_index, left_index].copy()
+    top *= (1.0 - fraction_x)[..., np.newaxis]
+    top += padded_channels[top_index, right_index] * fraction_x[..., np.newaxis]
+    bottom = padded_channels[bottom_index, left_index].copy()
+    bottom *= (1.0 - fraction_x)[..., np.newaxis]
+    bottom += padded_channels[bottom_index, right_index] * fraction_x[..., np.newaxis]
+    top *= (1.0 - fraction_y)[..., np.newaxis]
+    top += bottom * fraction_y[..., np.newaxis]
+    return top, valid
+
+
+def _find_transform_ecc_euclidean_core(
+    template: np.ndarray,
+    input_image: np.ndarray,
+    initial_matrix: np.ndarray,
+    max_iterations: int,
+    epsilon: float,
+) -> tuple[float, np.ndarray]:
+    """Optimize OpenCV's forward-additive Euclidean ECC equations."""
+    template_blurred = _gaussian_blur_5x5(template)
+    input_blurred = _gaussian_blur_5x5(input_image)
+    gradient_x, gradient_y = _central_gradients(input_blurred)
+    source_channels = np.stack((input_blurred, gradient_x, gradient_y), axis=2)
+    padded_channels = np.pad(
+        source_channels,
+        ((1, 1), (1, 1), (0, 0)),
+        mode="constant",
+    )
+    height, width = template_blurred.shape
+    destination_x = np.arange(width, dtype=np.float32)[np.newaxis, :]
+    destination_y = np.arange(height, dtype=np.float32)[:, np.newaxis]
+    matrix = np.asarray(initial_matrix, dtype=np.float32).reshape(2, 3).copy()
+    rho = -1.0
+
+    for _ in range(max_iterations):
+        last_rho = rho
+        warped, valid = _warp_ecc_channels(
+            padded_channels,
+            input_blurred.shape,
+            matrix,
+            destination_x,
+            destination_y,
+        )
+        valid_y, valid_x = np.nonzero(valid)
+        if valid_x.size < EccSettings.MIN_VALID_PIXELS:
+            raise EccConvergenceError("ECC has too little overlapping image area")
+
+        template_values = template_blurred[valid_y, valid_x]
+        input_values = warped[valid_y, valid_x, 0]
+        template_zero_mean = template_values - np.mean(template_values, dtype=np.float64)
+        input_zero_mean = input_values - np.mean(input_values, dtype=np.float64)
+        template_norm_squared = float(
+            np.sum(template_zero_mean * template_zero_mean, dtype=np.float64)
+        )
+        input_norm_squared = float(
+            np.sum(input_zero_mean * input_zero_mean, dtype=np.float64)
+        )
+        if template_norm_squared <= 0.0 or input_norm_squared <= 0.0:
+            raise EccConvergenceError("ECC cannot align a uniform image")
+        correlation = float(
+            np.sum(template_zero_mean * input_zero_mean, dtype=np.float64)
+        )
+        rho = correlation / np.sqrt(template_norm_squared * input_norm_squared)
+        if not np.isfinite(rho):
+            raise EccConvergenceError("ECC correlation became non-finite")
+
+        angle = asin(float(np.clip(matrix[1, 0], -1.0, 1.0)))
+        sine = np.float32(sin(angle))
+        cosine = np.float32(cos(angle))
+        x_coordinates = valid_x.astype(np.float32, copy=False)
+        y_coordinates = valid_y.astype(np.float32, copy=False)
+        warped_gradient_x = warped[valid_y, valid_x, 1]
+        warped_gradient_y = warped[valid_y, valid_x, 2]
+        jacobian = np.empty((valid_x.size, 3), dtype=np.float32)
+        jacobian[:, 0] = warped_gradient_x * (
+            -sine * x_coordinates - cosine * y_coordinates
+        ) + warped_gradient_y * (
+            cosine * x_coordinates - sine * y_coordinates
+        )
+        jacobian[:, 1] = warped_gradient_x
+        jacobian[:, 2] = warped_gradient_y
+
+        hessian = jacobian.T @ jacobian
+        image_projection = jacobian.T @ input_zero_mean
+        template_projection = jacobian.T @ template_zero_mean
+        try:
+            image_projection_hessian = np.linalg.solve(hessian, image_projection)
+        except np.linalg.LinAlgError as exc:
+            raise EccConvergenceError("ECC Hessian is singular") from exc
+        lambda_numerator = input_norm_squared - float(
+            image_projection @ image_projection_hessian
+        )
+        lambda_denominator = correlation - float(
+            template_projection @ image_projection_hessian
+        )
+        if not np.isfinite(lambda_denominator) or lambda_denominator <= 0.0:
+            raise EccConvergenceError("ECC images are uncorrelated or non-overlapping")
+        illumination_scale = lambda_numerator / lambda_denominator
+        error = illumination_scale * template_zero_mean - input_zero_mean
+        error_projection = jacobian.T @ error
+        try:
+            delta = np.linalg.solve(hessian, error_projection)
+        except np.linalg.LinAlgError as exc:
+            raise EccConvergenceError("ECC Hessian is singular") from exc
+        if not np.isfinite(delta).all():
+            raise EccConvergenceError("ECC update became non-finite")
+
+        angle += float(delta[0])
+        matrix[0, 0] = cos(angle)
+        matrix[0, 1] = -sin(angle)
+        matrix[1, 0] = sin(angle)
+        matrix[1, 1] = cos(angle)
+        matrix[0, 2] += delta[1]
+        matrix[1, 2] += delta[2]
+        if abs(rho - last_rho) < epsilon:
+            break
+
+    return float(rho), matrix
+
+
+def _resize_ecc_pair(
+    template: np.ndarray,
+    input_image: np.ndarray,
+    maximum_short_side: int,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Resize an ECC pair together and return its uniform coordinate scale."""
+    short_side = min(template.shape)
+    scale = min(1.0, maximum_short_side / short_side)
+    if scale == 1.0:
+        return template, input_image, scale
+    target_height = max(1, round(template.shape[0] * scale))
+    target_width = max(1, round(template.shape[1] * scale))
+    template_working = np.asarray(
+        Image.fromarray(template).resize(
+            (target_width, target_height),
+            resample=Image.Resampling.BOX,
+        ),
+        dtype=np.float32,
+    )
+    input_working = np.asarray(
+        Image.fromarray(input_image).resize(
+            (target_width, target_height),
+            resample=Image.Resampling.BOX,
+        ),
+        dtype=np.float32,
+    )
+    return template_working, input_working, scale
+
+
+def _scaled_ecc_matrix(matrix: np.ndarray, scale: float) -> np.ndarray:
+    """Move a destination-to-source transform into a scaled coordinate space."""
+    scaled = np.asarray(matrix, dtype=np.float32).reshape(2, 3).copy()
+    scaled[:, 2] *= np.float32(scale)
+    return scaled
+
+
+def _polish_ecc_translation(
+    template_working: np.ndarray,
+    input_working: np.ndarray,
+    matrix: np.ndarray,
+    scale: float,
+) -> np.ndarray:
+    """Use phase correlation to remove a small post-ECC translation residual."""
+    height, width = template_working.shape
+    working_matrix = _scaled_ecc_matrix(matrix, scale)
+    input_u8 = np.clip(np.rint(input_working * 255.0), 0, 255).astype(np.uint8)
+    template_u8 = np.clip(np.rint(template_working * 255.0), 0, 255).astype(np.uint8)
+    warped_input = _warp_bgr_affine_numpy(
+        _gray_to_bgr(input_u8),
+        working_matrix,
+        width,
+        height,
+    )[:, :, 0]
+    try:
+        residual, response = _phase_correlate(
+            template_u8.astype(np.float32),
+            warped_input.astype(np.float32),
+        )
+    except (MemoryError, TypeError, ValueError):
+        return matrix
+    if (
+        not np.isfinite(response)
+        or response < EccSettings.REFINEMENT_MIN_PHASE_SCORE
+        or not np.isfinite(residual).all()
+        or np.hypot(*residual) > EccSettings.REFINEMENT_MAX_PHASE_SHIFT_PX
+    ):
+        return matrix
+    polished = matrix.copy()
+    correction = np.asarray(residual, dtype=np.float32) / np.float32(scale)
+    polished[:, 2] += polished[:, :2] @ correction
+    return polished
+
+
+def _find_transform_ecc_euclidean(
+    template: np.ndarray,
+    input_image: np.ndarray,
+    initial_matrix: np.ndarray,
+    max_iterations: int,
+    epsilon: float,
+) -> tuple[float, np.ndarray]:
+    """Find a destination-to-source Euclidean transform without OpenCV.
+
+    This follows OpenCV's ECC preprocessing, Jacobian, illumination model,
+    update, and convergence rules. Large pages are optimized at a bounded
+    working resolution; the full-resolution phase estimate remains the
+    initializer and translations are scaled back into page coordinates.
+    """
+    template_float = np.asarray(template, dtype=np.float32)
+    input_float = np.asarray(input_image, dtype=np.float32)
+    if (
+        template_float.ndim != 2
+        or input_float.ndim != 2
+        or template_float.shape != input_float.shape
+        or not template_float.size
+    ):
+        raise ValueError("ECC inputs must be non-empty, same-size 2D arrays")
+    matrix = np.asarray(initial_matrix, dtype=np.float32)
+    if matrix.shape != (2, 3):
+        raise ValueError("Euclidean ECC requires a 2x3 initial matrix")
+    if max_iterations < 1 or epsilon < 0:
+        raise ValueError("ECC iteration count and epsilon must be non-negative")
+    if not (
+        np.isfinite(template_float).all()
+        and np.isfinite(input_float).all()
+        and np.isfinite(matrix).all()
+    ):
+        raise EccConvergenceError("ECC inputs must be finite")
+
+    source_short_side = min(template_float.shape)
+    template_working, input_working, scale = _resize_ecc_pair(
+        template_float,
+        input_float,
+        EccSettings.MAX_WORKING_SHORT_SIDE_PX,
+    )
+    score, matrix = _find_transform_ecc_euclidean_core(
+        template_working,
+        input_working,
+        _scaled_ecc_matrix(matrix, scale),
+        max_iterations,
+        epsilon,
+    )
+    if scale < 1.0:
+        matrix[:, 2] /= np.float32(scale)
+
+    rotation = abs(atan2(float(matrix[1, 0]), float(matrix[0, 0])))
+    should_refine = (
+        source_short_side >= EccSettings.REFINEMENT_MIN_SOURCE_SHORT_SIDE_PX
+        and score >= 0.50
+        and rotation >= EccSettings.REFINEMENT_MIN_ROTATION_RADIANS
+    )
+    if should_refine:
+        refinement_template, refinement_input, refinement_scale = _resize_ecc_pair(
+            template_float,
+            input_float,
+            EccSettings.REFINEMENT_SHORT_SIDE_PX,
+        )
+        try:
+            refined_score, refined_matrix = _find_transform_ecc_euclidean_core(
+                refinement_template,
+                refinement_input,
+                _scaled_ecc_matrix(matrix, refinement_scale),
+                EccSettings.REFINEMENT_ITERATIONS,
+                epsilon,
+            )
+        except (EccConvergenceError, MemoryError, np.linalg.LinAlgError):
+            pass
+        else:
+            if refinement_scale < 1.0:
+                refined_matrix[:, 2] /= np.float32(refinement_scale)
+            score = refined_score
+            matrix = _polish_ecc_translation(
+                refinement_template,
+                refinement_input,
+                refined_matrix,
+                refinement_scale,
+            )
+    return score, matrix
+
+
 def _coarse_ecc_score(
     old_gray: np.ndarray,
     new_gray: np.ndarray,
@@ -622,18 +986,14 @@ def _coarse_ecc_score(
     """Return a cheap Euclidean ECC score, or ``None`` when it is inconclusive."""
     matrix = np.float32([[1.0, 0.0, shift[0]], [0.0, 1.0, shift[1]]])
     try:
-        score, _ = cv2.findTransformECC(
+        score, _ = _find_transform_ecc_euclidean(
             new_gray.astype(np.float32) / 255.0,
             old_gray.astype(np.float32) / 255.0,
             matrix,
-            cv2.MOTION_EUCLIDEAN,
-            (
-                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-                AlignmentSettings.FAST_REJECT_ECC_MAX_ITERATIONS,
-                AlignmentSettings.FAST_REJECT_ECC_EPSILON,
-            ),
+            AlignmentSettings.FAST_REJECT_ECC_MAX_ITERATIONS,
+            AlignmentSettings.FAST_REJECT_ECC_EPSILON,
         )
-    except cv2.error:
+    except (EccConvergenceError, MemoryError, np.linalg.LinAlgError):
         return None
     return float(score) if np.isfinite(score) else None
 
@@ -702,12 +1062,12 @@ def _align_old_to_new(
     max_shift = max(target_h, target_w) * 0.35
     phase_is_plausible = np.isfinite(phase_score) and phase_score >= 0.20 and np.hypot(*shift) <= max_shift
     try:
-        score, matrix = cv2.findTransformECC(
+        score, matrix = _find_transform_ecc_euclidean(
             new_gray.astype(np.float32) / 255.0,
             old_gray.astype(np.float32) / 255.0,
             matrix,
-            cv2.MOTION_EUCLIDEAN,
-            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-6),
+            60,
+            1e-6,
         )
         if not np.isfinite(score) or score < 0.50:
             return resized, AlignmentMetadata(**{**base.__dict__, "message": f"ECC score {score:.3f} was too low; resize only"})
@@ -720,7 +1080,7 @@ def _align_old_to_new(
         )
         moved = not np.allclose(matrix, np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32), atol=0.15)
         return aligned, AlignmentMetadata("ecc-euclidean", True, float(score), matrix, (old_w, old_h), (target_w, target_h), moved)
-    except cv2.error as exc:
+    except (EccConvergenceError, MemoryError, np.linalg.LinAlgError) as exc:
         if phase_is_plausible:
             aligned = _warp_bgr_affine(
                 resized,

@@ -431,7 +431,7 @@ class MainWindow(QMainWindow):
         self.viewer.fit_region(ident)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        """Never destroy the QThread while its OpenCV/PDF work is active."""
+        """Never destroy the QThread while its image/PDF work is active."""
         if self.worker is not None and self.worker.isRunning():
             answer = QMessageBox.question(
                 self,

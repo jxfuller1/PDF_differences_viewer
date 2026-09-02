@@ -1,8 +1,8 @@
 # PDF Differences Viewer
 
 A native desktop application for comparing two PDF drawing revisions. It uses
-PyMuPDF and OpenCV to rasterize, align, and classify drawing differences, then
-uses **PyQt6 `QGraphicsView`** to render the result. There is no Qt WebEngine,
+PyMuPDF, Pillow, and NumPy to rasterize, align, and classify drawing differences,
+then uses **PyQt6 `QGraphicsView`** to render the result. There is no Qt WebEngine,
 embedded browser, local web server, or browser profile.
 
 ![Native viewer architecture](docs/native-viewer-architecture.svg)
@@ -28,7 +28,7 @@ git clone https://github.com/jxfuller1/PDF_differences_viewer.git
 cd PDF_differences_viewer
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
+pip install -e .
 pdf-differences-viewer
 ```
 
@@ -71,17 +71,20 @@ pytest
 The application deliberately uses Qt's scene graph rather than HTML:
 
 ```text
-PDFs → OpenCV comparison → QGraphicsScene
-                           ├── old drawing pixmap
-                           ├── new drawing pixmap
-                           ├── bright-blue additions pixmap
-                           ├── bright-red removals pixmap
-                           └── interactive region overlays
+PDFs → NumPy/Pillow comparison → QGraphicsScene
+                                 ├── old drawing pixmap
+                                 ├── new drawing pixmap
+                                 ├── bright-blue additions pixmap
+                                 ├── bright-red removals pixmap
+                                 └── interactive region overlays
 ```
 
 The `QGraphicsView` approach lets Qt composite the layers directly, preserves
 high-quality pixmap rendering at arbitrary zoom levels and makes region
 selection native Qt interactions.
+
+OpenCV is not a runtime dependency. The development extra retains it only as
+an independent compatibility oracle for the image-processing tests.
 
 ## Attribution
 
