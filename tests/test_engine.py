@@ -25,6 +25,7 @@ from pdf_differences_viewer.engine import (
     _should_fast_reject_ecc,
     _warp_bgr_affine,
     _warp_bgr_affine_numpy,
+    _warp_binary_translation_nearest,
     compare_page_images,
     compare_pdf_pages,
     render_pdf_page,
@@ -71,6 +72,41 @@ def test_pillow_resize_and_numpy_affine_warp_preserve_bgr_geometry() -> None:
     warped = _warp_bgr_affine(source, matrix, 5, 5)
     np.testing.assert_array_equal(warped[2, 2], (0, 0, 0))
     assert np.count_nonzero(np.all(warped == 0, axis=2)) == 1
+
+
+def test_numpy_binary_translation_matches_opencv_nearest_inverse_warp() -> None:
+    rng = np.random.default_rng(47)
+    source = np.where(rng.random((17, 23)) < 0.22, 1, 0).astype(np.uint8)
+    shifts = (
+        (-4.75, 3.125),
+        (-1.5006, -0.5006),
+        (-1.5, -0.5),
+        (-1.4996, -0.4996),
+        (0.0, 0.0),
+        (0.4996, 1.4996),
+        (0.5, 1.5),
+        (0.5006, 1.5006),
+        (8.25, -6.75),
+    )
+
+    for target_width, target_height in ((23, 17), (29, 21), (11, 9)):
+        for shift in shifts:
+            matrix = np.float32([[1.0, 0.0, shift[0]], [0.0, 1.0, shift[1]]])
+            expected = cv2.warpAffine(
+                source,
+                matrix,
+                (target_width, target_height),
+                flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            actual = _warp_binary_translation_nearest(
+                source,
+                shift,
+                target_width,
+                target_height,
+            )
+            np.testing.assert_array_equal(actual, expected)
 
 
 def test_fast_qt_affine_path_preserves_the_numpy_ink_mask() -> None:

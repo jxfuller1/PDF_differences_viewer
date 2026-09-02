@@ -535,6 +535,63 @@ def _phase_correlate(
     )
 
 
+def _warp_binary_translation_nearest(
+    source: np.ndarray,
+    shift: tuple[float, float],
+    target_width: int,
+    target_height: int,
+) -> np.ndarray:
+    """Apply OpenCV-compatible inverse translation with nearest sampling.
+
+    This is the only affine operation needed by the coarse ink-overlap gate.
+    OpenCV first stores its translation matrix as float32, maps every target
+    coordinate back into the source, rounds to the nearest-even integer, and
+    fills coordinates outside the source with zero.
+    """
+    source = np.asarray(source)
+    if source.ndim != 2 or not source.size:
+        raise ValueError("source must be a non-empty 2D array")
+    if target_width < 1 or target_height < 1:
+        raise ValueError("target dimensions must be positive")
+    shift_x, shift_y = np.asarray(shift, dtype=np.float32)
+    if not np.isfinite(shift_x) or not np.isfinite(shift_y):
+        raise ValueError("translation must be finite")
+
+    source_xs = np.rint(
+        np.arange(target_width, dtype=np.float64) + np.float64(shift_x)
+    ).astype(np.intp)
+    source_ys = np.rint(
+        np.arange(target_height, dtype=np.float64) + np.float64(shift_y)
+    ).astype(np.intp)
+    valid_x = (source_xs >= 0) & (source_xs < source.shape[1])
+    valid_y = (source_ys >= 0) & (source_ys < source.shape[0])
+    output = np.zeros((target_height, target_width), dtype=source.dtype)
+    if np.any(valid_x) and np.any(valid_y):
+        destination_xs = np.flatnonzero(valid_x)
+        destination_ys = np.flatnonzero(valid_y)
+        selected_source_xs = source_xs[valid_x]
+        selected_source_ys = source_ys[valid_y]
+        x_is_contiguous = selected_source_xs.size == 1 or np.all(
+            np.diff(selected_source_xs) == 1
+        )
+        y_is_contiguous = selected_source_ys.size == 1 or np.all(
+            np.diff(selected_source_ys) == 1
+        )
+        if x_is_contiguous and y_is_contiguous:
+            output[
+                destination_ys[0] : destination_ys[-1] + 1,
+                destination_xs[0] : destination_xs[-1] + 1,
+            ] = source[
+                selected_source_ys[0] : selected_source_ys[-1] + 1,
+                selected_source_xs[0] : selected_source_xs[-1] + 1,
+            ]
+        else:
+            output[np.ix_(destination_ys, destination_xs)] = source[
+                np.ix_(selected_source_ys, selected_source_xs)
+            ]
+    return output
+
+
 def _coarse_ink_iou(
     old_gray: np.ndarray,
     new_gray: np.ndarray,
@@ -544,14 +601,11 @@ def _coarse_ink_iou(
     """Return raw ink IoU after phase's destination-to-source translation."""
     old_ink = (old_gray < ink_threshold).astype(np.uint8)
     new_ink = new_gray < ink_threshold
-    matrix = np.float32([[1.0, 0.0, shift[0]], [0.0, 1.0, shift[1]]])
-    old_aligned = cv2.warpAffine(
+    old_aligned = _warp_binary_translation_nearest(
         old_ink,
-        matrix,
-        (new_gray.shape[1], new_gray.shape[0]),
-        flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
+        shift,
+        new_gray.shape[1],
+        new_gray.shape[0],
     )
     union = np.count_nonzero((old_aligned > 0) | new_ink)
     if not union:
