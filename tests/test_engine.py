@@ -733,6 +733,36 @@ def test_regions_without_opencv_components_match_randomized_legacy_results() -> 
                 assert actual == sorted(expected, key=_region_order)
 
 
+def test_regions_edge_shapes_and_offsets_match_legacy_oracle() -> None:
+    """Exercise small/degenerate masks and positive (not just 255) pixels."""
+    masks = [
+        np.zeros((1, 1), dtype=np.uint8),  # empty foreground
+        np.array([[0, 255, 0, 255, 0]], dtype=np.uint8),  # single row
+        np.array([[17], [0], [23], [0], [17]], dtype=np.uint8),  # single column
+        np.array(
+            [[255, 0, 0, 0, 255], [0, 255, 0, 255, 0], [0, 0, 255, 0, 0]],
+            dtype=np.uint8,
+        ),  # diagonal 8-connected pixels
+        np.array(
+            [[31, 0, 0, 0, 31], [0, 0, 0, 0, 0], [31, 0, 0, 0, 31]],
+            dtype=np.uint8,
+        ),  # border and non-binary positive values
+    ]
+    for base in masks:
+        for offset_x, offset_y in ((0, 0), (3, 2)):
+            mask = np.zeros((base.shape[0] + offset_y + 2, base.shape[1] + offset_x + 2), dtype=np.uint8)
+            if base.size:
+                mask[offset_y : offset_y + base.shape[0], offset_x : offset_x + base.shape[1]] = base
+            for minimum_area in (1, 2, 5):
+                for merge_distance in (0, 2, 20):
+                    for kind in ("added", "removed"):
+                        expected = sorted(
+                            _legacy_regions(mask, kind, minimum_area, merge_distance),
+                            key=_region_order,
+                        )
+                        assert _regions(mask, kind, minimum_area, merge_distance) == expected
+
+
 def test_binary_mask_dilation_matches_opencv_rectangular_kernels() -> None:
     rng = np.random.default_rng(7)
     mask = np.where(rng.random((23, 31)) > 0.88, 255, 0).astype(np.uint8)

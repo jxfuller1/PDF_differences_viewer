@@ -1564,119 +1564,112 @@ def _dilate_binary_mask_integral(mask: np.ndarray, kernel_size: int) -> np.ndarr
     return np.where(window_sums > 0, 255, 0).astype(np.uint8)
 
 
-def _foreground_runs(row: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return inclusive start/end columns of a boolean row's foreground runs."""
-    columns = np.flatnonzero(row)
-    if not columns.size:
-        return columns, columns
-    split_indices = np.flatnonzero(np.diff(columns) > 1) + 1
-    return (
-        np.concatenate((columns[:1], columns[split_indices])),
-        np.concatenate((columns[split_indices - 1], columns[-1:])),
+def _foreground_run_table(foreground: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return row/start/end arrays for all horizontal foreground runs.
+
+    Finding every row transition in one NumPy operation avoids thousands of
+    small ``flatnonzero`` calls on high-DPI pages.  Each row contributes an
+    even number of transitions, so the flattened transition indices pair into
+    inclusive run bounds without storing every foreground pixel coordinate.
+    """
+    height, width = foreground.shape
+    if not height or not width:
+        empty = np.empty(0, dtype=np.intp)
+        return empty, empty, empty
+    transitions = np.empty((height, width + 1), dtype=bool)
+    transitions[:, 0] = foreground[:, 0]
+    if width > 1:
+        np.not_equal(
+            foreground[:, 1:],
+            foreground[:, :-1],
+            out=transitions[:, 1:width],
+        )
+    transitions[:, width] = foreground[:, -1]
+    transition_indices = np.flatnonzero(transitions)
+    if not transition_indices.size:
+        empty = np.empty(0, dtype=np.intp)
+        return empty, empty, empty
+    rows, columns = np.divmod(transition_indices, width + 1)
+    return rows[::2], columns[::2], columns[1::2] - 1
+
+
+def _connected_run_labels_8(
+    rows: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    height: int,
+) -> tuple[int, np.ndarray]:
+    """Assign compact 8-connected component labels to horizontal runs."""
+    run_count = rows.size
+    if not run_count:
+        return 1, np.empty(0, dtype=np.intp)
+
+    row_offsets = np.empty(height + 1, dtype=np.intp)
+    row_offsets[0] = 0
+    np.cumsum(np.bincount(rows, minlength=height), out=row_offsets[1:])
+    parents = np.arange(run_count, dtype=np.intp)
+
+    def find(label: int) -> int:
+        root = label
+        while parents[root] != root:
+            root = int(parents[root])
+        while parents[label] != label:
+            parent = int(parents[label])
+            parents[label] = root
+            label = parent
+        return root
+
+    def union(first: int, second: int) -> None:
+        first_root, second_root = find(first), find(second)
+        if first_root == second_root:
+            return
+        # Runs are row-major; retaining the earliest root keeps the trees
+        # shallow for drawing-like masks and makes labels deterministic.
+        if first_root < second_root:
+            parents[second_root] = first_root
+        else:
+            parents[first_root] = second_root
+
+    for row in range(1, height):
+        previous = int(row_offsets[row - 1])
+        previous_stop = int(row_offsets[row])
+        current = previous_stop
+        current_stop = int(row_offsets[row + 1])
+        while previous < previous_stop and current < current_stop:
+            if ends[previous] < starts[current] - 1:
+                previous += 1
+            elif ends[current] < starts[previous] - 1:
+                current += 1
+            else:
+                union(previous, current)
+                if ends[previous] < ends[current]:
+                    previous += 1
+                elif ends[current] < ends[previous]:
+                    current += 1
+                else:
+                    previous += 1
+                    current += 1
+
+    roots = np.fromiter(
+        (find(index) for index in range(run_count)),
+        dtype=np.intp,
+        count=run_count,
     )
+    component_roots = np.unique(roots)
+    run_labels = np.searchsorted(component_roots, roots) + 1
+    return int(component_roots.size + 1), run_labels
 
 
 def _connected_components_8(mask: np.ndarray) -> tuple[int, np.ndarray]:
-    """Label nonzero pixels with 8-connectivity without OpenCV.
-
-    This run-length union-find implementation avoids a Python loop for every
-    foreground pixel. Runs in adjacent rows connect when their intervals touch
-    or overlap after expanding either interval by one column, which includes
-    the diagonal neighbors required by 8-connectivity.
-    """
+    """Return a dense 8-connected label image for callers that need one."""
     foreground = np.ascontiguousarray(mask > 0)
     height, width = foreground.shape
-    if not np.any(foreground):
-        return 1, np.zeros((height, width), dtype=np.int32)
-
-    parents = [0]
-
-    def find(label: int) -> int:
-        while parents[label] != label:
-            parents[label] = parents[parents[label]]
-            label = parents[label]
-        return label
-
-    def union(first: int, second: int) -> int:
-        first_root, second_root = find(first), find(second)
-        if first_root == second_root:
-            return first_root
-        # Keeping the earliest provisional label as root makes final component
-        # order deterministic and compatible with raster-order region output.
-        if first_root < second_root:
-            parents[second_root] = first_root
-            return first_root
-        parents[first_root] = second_root
-        return second_root
-
-    empty = np.empty(0, dtype=np.intp)
-    previous_starts = previous_ends = previous_labels = empty
-    next_label = 1
-    for row in foreground:
-        starts, ends = _foreground_runs(row)
-        current_labels = np.empty(starts.size, dtype=np.int32)
-        previous_index = 0
-        for index, (start, end) in enumerate(zip(starts, ends)):
-            while (
-                previous_index < previous_starts.size
-                and previous_ends[previous_index] < start - 1
-            ):
-                previous_index += 1
-
-            candidate_index = previous_index
-            label = 0
-            while (
-                candidate_index < previous_starts.size
-                and previous_starts[candidate_index] <= end + 1
-            ):
-                candidate_label = int(previous_labels[candidate_index])
-                label = candidate_label if label == 0 else union(label, candidate_label)
-                candidate_index += 1
-
-            if label == 0:
-                label = next_label
-                parents.append(label)
-                next_label += 1
-            current_labels[index] = find(label)
-
-        previous_starts, previous_ends, previous_labels = starts, ends, current_labels
-
-    roots = np.arange(next_label, dtype=np.int32)
-    for label in range(1, next_label):
-        roots[label] = find(label)
-    component_roots = np.unique(roots[1:])
-    compact_labels = np.zeros(next_label, dtype=np.int32)
-    compact_labels[component_roots] = np.arange(1, component_roots.size + 1, dtype=np.int32)
-
-    # Scan a second time so the dense label image can be built without storing
-    # every run from the first pass. New provisional labels are created in the
-    # same row-major order, then mapped to their final union-find component.
+    rows, starts, ends = _foreground_run_table(foreground)
+    count, run_labels = _connected_run_labels_8(rows, starts, ends, height)
     labels = np.zeros((height, width), dtype=np.int32)
-    previous_starts = previous_ends = previous_labels = empty
-    next_label = 1
-    for row_index, row in enumerate(foreground):
-        starts, ends = _foreground_runs(row)
-        current_labels = np.empty(starts.size, dtype=np.int32)
-        previous_index = 0
-        for index, (start, end) in enumerate(zip(starts, ends)):
-            while (
-                previous_index < previous_starts.size
-                and previous_ends[previous_index] < start - 1
-            ):
-                previous_index += 1
-            if (
-                previous_index < previous_starts.size
-                and previous_starts[previous_index] <= end + 1
-            ):
-                label = int(previous_labels[previous_index])
-            else:
-                label = next_label
-                next_label += 1
-            current_labels[index] = label
-            labels[row_index, start : end + 1] = compact_labels[roots[label]]
-        previous_starts, previous_ends, previous_labels = starts, ends, current_labels
-
-    return int(component_roots.size + 1), labels
+    for row, start, end, label in zip(rows, starts, ends, run_labels):
+        labels[row, start : end + 1] = label
+    return count, labels
 
 
 def _regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distance: int) -> list[DifferenceRegion]:
@@ -1689,39 +1682,66 @@ def _regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distance: int
     Regions are returned in stable top-to-bottom, left-to-right order instead
     of depending on a particular labeling backend's internal ID order.
     """
-    if not np.any(mask):
+    raw_foreground = np.ascontiguousarray(mask > 0)
+    occupied_rows = np.flatnonzero(np.any(raw_foreground, axis=1))
+    if not occupied_rows.size:
         return []
+    occupied_columns = np.flatnonzero(np.any(raw_foreground, axis=0))
+    top, bottom = int(occupied_rows[0]), int(occupied_rows[-1]) + 1
+    left, right = int(occupied_columns[0]), int(occupied_columns[-1]) + 1
+    raw_foreground = np.ascontiguousarray(raw_foreground[top:bottom, left:right])
+
     if merge_distance:
-        grouped = _dilate_binary_mask(mask, merge_distance)
+        grouped = np.ascontiguousarray(
+            _dilate_binary_mask(raw_foreground, merge_distance) > 0
+        )
     else:
-        grouped = mask
-    count, labels = _connected_components_8(grouped)
-    # Work only with changed pixels once.  The former implementation compared
-    # every page pixel against every component label, which becomes especially
-    # expensive at high DPI when a page has many regions.
-    ys, xs = np.nonzero(mask)
-    pixel_labels = labels[ys, xs]
-    areas = np.bincount(pixel_labels, minlength=count)
+        grouped = raw_foreground
+
+    height, width = grouped.shape
+    grouped_rows, grouped_starts, grouped_ends = _foreground_run_table(grouped)
+    count, grouped_labels = _connected_run_labels_8(
+        grouped_rows,
+        grouped_starts,
+        grouped_ends,
+        height,
+    )
+
+    if merge_distance:
+        raw_rows, raw_starts, raw_ends = _foreground_run_table(raw_foreground)
+        # A raw run is contained in exactly one dilated run.  Flattening each
+        # row into a disjoint numeric range lets one vectorized search map all
+        # raw runs back to their grouped component labels.
+        stride = width + 1
+        grouped_end_keys = grouped_rows * stride + grouped_ends
+        raw_start_keys = raw_rows * stride + raw_starts
+        grouped_indices = np.searchsorted(grouped_end_keys, raw_start_keys)
+        raw_labels = grouped_labels[grouped_indices]
+    else:
+        raw_rows, raw_starts, raw_ends = grouped_rows, grouped_starts, grouped_ends
+        raw_labels = grouped_labels
+
+    run_lengths = raw_ends - raw_starts + 1
+    areas = np.bincount(raw_labels, weights=run_lengths, minlength=count).astype(np.intp)
     eligible_labels = np.flatnonzero(areas >= minimum_area)
     eligible_labels = eligible_labels[eligible_labels > 0]
     if not eligible_labels.size:
         return []
 
-    height, width = mask.shape
     min_x = np.full(count, width, dtype=np.intp)
     max_x = np.full(count, -1, dtype=np.intp)
     min_y = np.full(count, height, dtype=np.intp)
     max_y = np.full(count, -1, dtype=np.intp)
-    np.minimum.at(min_x, pixel_labels, xs)
-    np.maximum.at(max_x, pixel_labels, xs)
-    np.minimum.at(min_y, pixel_labels, ys)
-    np.maximum.at(max_y, pixel_labels, ys)
+    np.minimum.at(min_x, raw_labels, raw_starts)
+    np.maximum.at(max_x, raw_labels, raw_ends)
+    np.minimum.at(min_y, raw_labels, raw_rows)
+    np.maximum.at(max_y, raw_labels, raw_rows)
 
     regions = [
         DifferenceRegion(
             (
-                int(min_x[label]),
-                int(min_y[label]),
+                int(min_x[label] + left),
+                int(min_y[label] + top),
                 int(max_x[label] - min_x[label] + 1),
                 int(max_y[label] - min_y[label] + 1),
             ),
