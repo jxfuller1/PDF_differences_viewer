@@ -2,7 +2,7 @@
 
 
 class DifferenceColors:
-    """Palette for additions and removals in Qt (RGB) and OpenCV (BGR)."""
+    """Palette for additions and removals in Qt RGB and image-buffer BGR."""
 
     ADDITION_RGB = (0, 102, 255)  # bright blue
     REMOVAL_RGB = (245, 45, 45)   # bright red

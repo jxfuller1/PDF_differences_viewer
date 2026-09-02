@@ -3,11 +3,14 @@ from __future__ import annotations
 import cv2
 import pymupdf as fitz
 import numpy as np
+import pytest
 
 import pdf_differences_viewer.engine as engine
 from pdf_differences_viewer.colors import DifferenceColors
 from pdf_differences_viewer.engine import (
     DifferenceRegion,
+    EccConvergenceError,
+    EccSettings,
     _align_old_to_new,
     _bgr_to_bgra,
     _bgr_to_gray,
@@ -16,6 +19,8 @@ from pdf_differences_viewer.engine import (
     _distance_transform_l2_mask3,
     _dilate_binary_mask,
     _difference_mask,
+    _find_transform_ecc_euclidean,
+    _gaussian_blur_5x5,
     _gray_to_bgr,
     _ink_mask,
     _phase_correlate,
@@ -251,6 +256,109 @@ def test_numpy_phase_correlate_matches_opencv_shift_and_response() -> None:
         np.testing.assert_allclose(actual_response, expected_response, rtol=0, atol=2e-5)
 
 
+def test_numpy_ecc_preprocessing_matches_opencv_gaussian() -> None:
+    rng = np.random.default_rng(101)
+    image = rng.random((53, 71), dtype=np.float32)
+
+    expected = cv2.GaussianBlur(image, (5, 5), 0)
+    actual = _gaussian_blur_5x5(image)
+
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=2e-7)
+
+
+def test_numpy_ecc_matches_opencv_euclidean_alignment() -> None:
+    height, width = 240, 320
+    source = np.ones((height, width), dtype=np.float32)
+    source[35:145, 50:230] = 0.12
+    source[168:205, 180:280] = 0.45
+    angle = np.deg2rad(0.8)
+    expected_matrix = np.array(
+        [
+            [np.cos(angle), -np.sin(angle), 7.25],
+            [np.sin(angle), np.cos(angle), -5.5],
+        ],
+        dtype=np.float32,
+    )
+    template = cv2.warpAffine(
+        source,
+        expected_matrix,
+        (width, height),
+        flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    initial = np.array([[1, 0, 7.25], [0, 1, -5.5]], dtype=np.float32)
+    expected_score, expected = cv2.findTransformECC(
+        template,
+        source,
+        initial.copy(),
+        cv2.MOTION_EUCLIDEAN,
+        (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-6),
+    )
+
+    actual_score, actual = _find_transform_ecc_euclidean(
+        template,
+        source,
+        initial,
+        60,
+        1e-6,
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=2e-4)
+    np.testing.assert_allclose(actual_score, expected_score, rtol=0, atol=2e-6)
+
+
+def test_numpy_ecc_reports_uniform_images_as_inconclusive() -> None:
+    uniform = np.ones((64, 80), dtype=np.float32)
+
+    with pytest.raises(EccConvergenceError, match="uniform"):
+        _find_transform_ecc_euclidean(
+            uniform,
+            uniform,
+            np.eye(2, 3, dtype=np.float32),
+            20,
+            1e-4,
+        )
+
+
+def test_numpy_ecc_pyramid_keeps_full_resolution_matrix_coordinates(monkeypatch) -> None:
+    monkeypatch.setattr(EccSettings, "MAX_WORKING_SHORT_SIDE_PX", 120)
+    monkeypatch.setattr(EccSettings, "REFINEMENT_MIN_SOURCE_SHORT_SIDE_PX", 1)
+    monkeypatch.setattr(EccSettings, "REFINEMENT_SHORT_SIDE_PX", 180)
+    height, width = 240, 320
+    source = np.ones((height, width), dtype=np.float32)
+    source[35:145, 50:230] = 0.12
+    source[168:205, 180:280] = 0.45
+    angle = np.deg2rad(0.8)
+    expected = np.array(
+        [
+            [np.cos(angle), -np.sin(angle), 7.25],
+            [np.sin(angle), np.cos(angle), -5.5],
+        ],
+        dtype=np.float32,
+    )
+    template = cv2.warpAffine(
+        source,
+        expected,
+        (width, height),
+        flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+    score, actual = _find_transform_ecc_euclidean(
+        template,
+        source,
+        np.array([[1, 0, 7.25], [0, 1, -5.5]], dtype=np.float32),
+        60,
+        1e-6,
+    )
+
+    assert score > 0.95
+    np.testing.assert_allclose(actual[:, :2], expected[:, :2], rtol=0, atol=2e-3)
+    np.testing.assert_allclose(actual[:, 2], expected[:, 2], rtol=0, atol=0.11)
+
+
 def test_old_page_is_resized_to_new_page_dimensions() -> None:
     old = _blank(120, 160)
     new = _blank(200, 300)
@@ -285,7 +393,7 @@ def test_fast_reject_requires_low_phase_confidence_and_low_ink_overlap(monkeypat
     new[58:82, 82:106] = 0
 
     monkeypatch.setattr(engine, "_phase_correlate", lambda *_args: ((0.0, 0.0), 0.0))
-    monkeypatch.setattr(engine.cv2, "findTransformECC", lambda *_args: (0.1, np.eye(2, 3, dtype=np.float32)))
+    monkeypatch.setattr(engine, "_find_transform_ecc_euclidean", lambda *_args: (0.1, np.eye(2, 3, dtype=np.float32)))
     assert _should_fast_reject_ecc(_bgr_to_gray(old), _bgr_to_gray(new), 245)
 
     # Low phase confidence alone is not enough: matching ink remains eligible
@@ -299,7 +407,7 @@ def test_fast_reject_defers_when_coarse_ecc_finds_a_plausible_alignment(monkeypa
     old[12:36, 12:36] = 0
     new[58:82, 82:106] = 0
     monkeypatch.setattr(engine, "_phase_correlate", lambda *_args: ((0.0, 0.0), 0.0))
-    monkeypatch.setattr(engine.cv2, "findTransformECC", lambda *_args: (0.95, np.eye(2, 3, dtype=np.float32)))
+    monkeypatch.setattr(engine, "_find_transform_ecc_euclidean", lambda *_args: (0.95, np.eye(2, 3, dtype=np.float32)))
 
     assert not _should_fast_reject_ecc(_bgr_to_gray(old), _bgr_to_gray(new), 245)
 
@@ -312,9 +420,9 @@ def test_fast_reject_defers_when_coarse_ecc_is_inconclusive(monkeypatch) -> None
     monkeypatch.setattr(engine, "_phase_correlate", lambda *_args: ((0.0, 0.0), 0.0))
 
     def failed_ecc(*_args):
-        raise cv2.error("coarse alignment was inconclusive")
+        raise EccConvergenceError("coarse alignment was inconclusive")
 
-    monkeypatch.setattr(engine.cv2, "findTransformECC", failed_ecc)
+    monkeypatch.setattr(engine, "_find_transform_ecc_euclidean", failed_ecc)
     assert not _should_fast_reject_ecc(_bgr_to_gray(old), _bgr_to_gray(new), 245)
 
 
@@ -330,7 +438,7 @@ def test_fast_reject_skips_ecc_and_preserves_resize_only_regions(monkeypatch) ->
         ecc_shapes.append(template.shape)
         return 0.1, np.eye(2, 3, dtype=np.float32)
 
-    monkeypatch.setattr(engine.cv2, "findTransformECC", low_score_coarse_ecc)
+    monkeypatch.setattr(engine, "_find_transform_ecc_euclidean", low_score_coarse_ecc)
     aligned, metadata = _align_old_to_new(old, new)
     np.testing.assert_array_equal(aligned, _resize_bgr(old, new.shape[1], new.shape[0]))
     assert metadata.method == "resize"
@@ -359,7 +467,7 @@ def test_fast_reject_defers_to_full_ecc_when_phase_is_plausible(monkeypatch) -> 
         calls += 1
         return 0.95, np.eye(2, 3, dtype=np.float32)
 
-    monkeypatch.setattr(engine.cv2, "findTransformECC", successful_ecc)
+    monkeypatch.setattr(engine, "_find_transform_ecc_euclidean", successful_ecc)
     _aligned, metadata = _align_old_to_new(old, old)
     assert calls == 1
     assert metadata.method == "ecc-euclidean"
@@ -525,5 +633,3 @@ def test_pdf_pages_render_and_compare(tmp_path) -> None:
     assert rendered.width > 0 and rendered.height > 0
     assert rendered.bgra.shape[2] == 4
     assert result.added_pixels > 0
-
-
