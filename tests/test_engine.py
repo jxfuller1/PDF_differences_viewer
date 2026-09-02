@@ -31,6 +31,8 @@ from pdf_differences_viewer.engine import (
     _warp_bgr_affine,
     _warp_bgr_affine_numpy,
     _warp_binary_translation_nearest,
+    _warp_ecc_channels,
+    _warp_ecc_channels_numpy,
     compare_page_images,
     compare_pdf_pages,
     render_pdf_page,
@@ -264,6 +266,88 @@ def test_numpy_ecc_preprocessing_matches_opencv_gaussian() -> None:
     actual = _gaussian_blur_5x5(image)
 
     np.testing.assert_allclose(actual, expected, rtol=0, atol=2e-7)
+
+
+def test_pillow_ecc_warp_preserves_numpy_validity_and_border_sampling() -> None:
+    rng = np.random.default_rng(307)
+    intensity = rng.random((768, 1024), dtype=np.float32)
+    intensity = _gaussian_blur_5x5(intensity)
+    gradient_x, gradient_y = engine._central_gradients(intensity)
+    source = np.stack((intensity, gradient_x, gradient_y), axis=2)
+    padded = np.pad(source, ((1, 1), (1, 1), (0, 0)), mode="constant")
+    angle = np.deg2rad(0.7)
+    matrix = np.array(
+        [
+            [np.cos(angle), -np.sin(angle), -0.35],
+            [np.sin(angle), np.cos(angle), 0.4],
+        ],
+        dtype=np.float32,
+    )
+    destination_x = np.arange(source.shape[1], dtype=np.float32)[np.newaxis, :]
+    destination_y = np.arange(source.shape[0], dtype=np.float32)[:, np.newaxis]
+
+    expected_warped, expected_valid = _warp_ecc_channels_numpy(
+        padded,
+        source.shape[:2],
+        matrix,
+        destination_x,
+        destination_y,
+    )
+    actual_warped, actual_valid = _warp_ecc_channels(
+        padded,
+        source.shape[:2],
+        matrix,
+        destination_x,
+        destination_y,
+    )
+
+    np.testing.assert_array_equal(actual_valid, expected_valid)
+    np.testing.assert_allclose(
+        actual_warped[actual_valid],
+        expected_warped[expected_valid],
+        rtol=0,
+        atol=2e-4,
+    )
+
+
+def test_pillow_ecc_warp_falls_back_to_numpy(monkeypatch) -> None:
+    source = np.arange(7 * 9 * 3, dtype=np.float32).reshape(7, 9, 3)
+    padded = np.pad(source, ((1, 1), (1, 1), (0, 0)), mode="constant")
+    matrix = np.array([[1, 0, 0.25], [0, 1, -0.4]], dtype=np.float32)
+    destination_x = np.arange(source.shape[1], dtype=np.float32)[np.newaxis, :]
+    destination_y = np.arange(source.shape[0], dtype=np.float32)[:, np.newaxis]
+    expected = _warp_ecc_channels_numpy(
+        padded,
+        source.shape[:2],
+        matrix,
+        destination_x,
+        destination_y,
+    )
+
+    transform_calls = 0
+
+    def unavailable(*_args, **_kwargs):
+        nonlocal transform_calls
+        transform_calls += 1
+        raise OSError("compiled affine sampler unavailable")
+
+    monkeypatch.setattr(engine.Image.Image, "transform", unavailable)
+    with engine._EccChannelWarper(
+        padded,
+        source.shape[:2],
+        destination_x,
+        destination_y,
+    ) as warper:
+        actual = warper.warp(matrix)
+        calls_after_failure = transform_calls
+        second = warper.warp(matrix)
+
+    np.testing.assert_array_equal(actual[0], expected[0])
+    np.testing.assert_array_equal(actual[1], expected[1])
+    np.testing.assert_array_equal(second[0], expected[0])
+    np.testing.assert_array_equal(second[1], expected[1])
+    assert calls_after_failure > 0
+    assert transform_calls == calls_after_failure
 
 
 def test_numpy_ecc_matches_opencv_euclidean_alignment() -> None:
