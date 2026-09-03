@@ -858,7 +858,7 @@ def _warp_ecc_channels_numpy(
     destination_x: np.ndarray,
     destination_y: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Inverse-sample ECC intensity/gradient channels and their valid mask."""
+    """Inverse-sample ECC channels into contiguous channel-first storage."""
     source_height, source_width = source_shape
     source_x = (
         matrix[0, 0] * destination_x
@@ -896,7 +896,7 @@ def _warp_ecc_channels_numpy(
     bottom += padded_channels[bottom_index, right_index] * fraction_x[..., np.newaxis]
     top *= (1.0 - fraction_y)[..., np.newaxis]
     top += bottom * fraction_y[..., np.newaxis]
-    return top, valid
+    return np.ascontiguousarray(np.moveaxis(top, 2, 0)), valid
 
 
 def _ecc_pillow_affine(matrix: np.ndarray) -> tuple[float, ...]:
@@ -955,7 +955,9 @@ def _warp_ecc_channels_pillow(
         transformed = tuple(transform(image) for image in source_images)
     else:
         transformed = tuple(executor.map(transform, source_images))
-    warped = np.stack(tuple(np.asarray(image) for image in transformed), axis=2)
+    # Channel-first storage makes each flattened channel contiguous and lets
+    # the iteration workspace gather all three channels in one operation.
+    warped = np.stack(tuple(np.asarray(image) for image in transformed), axis=0)
 
     # Preserve the original nearest-coordinate validity rule exactly. Pillow's
     # nearest filter differs at a few half-pixel ties.
@@ -1008,7 +1010,7 @@ def _warp_ecc_channels_pillow(
         bottom += padded_channels[bottom_index, right_index] * fraction_x[:, np.newaxis]
         top *= (1.0 - fraction_y)[:, np.newaxis]
         top += bottom * fraction_y[:, np.newaxis]
-        warped[edge_y, edge_x] = top
+        warped[:, edge_y, edge_x] = top.T
     return warped, valid
 
 
@@ -1107,9 +1109,9 @@ class _EccIterationWorkspace:
         self._input_zero_mean = np.empty(maximum_pixels, dtype=np.float64)
         self._x_coordinates = np.empty(maximum_pixels, dtype=np.float32)
         self._y_coordinates = np.empty(maximum_pixels, dtype=np.float32)
-        self._jacobian = np.empty((3, maximum_pixels), dtype=np.float32)
+        self._jacobian = np.empty(3 * maximum_pixels, dtype=np.float32)
         self._projection_jacobian = np.empty(
-            (3, maximum_pixels),
+            3 * maximum_pixels,
             dtype=np.float64,
         )
         self._valid_indices: np.ndarray | None = None
@@ -1133,22 +1135,39 @@ class _EccIterationWorkspace:
         sample = self._sample[:count]
         template_zero_mean = self._template_zero_mean[:count]
         input_zero_mean = self._input_zero_mean[:count]
-        np.take(template, valid_indices, out=sample)
+        # ``flatnonzero`` guarantees that every index is nonnegative and in
+        # bounds. ``clip`` is therefore equivalent to the default ``raise``
+        # behavior here, while allowing NumPy to write directly into ``out``.
+        np.take(template, valid_indices, out=sample, mode="clip")
         np.subtract(
             sample,
             np.mean(sample, dtype=np.float64),
             out=template_zero_mean,
         )
-        np.take(warped[:, :, 0], valid_indices, out=sample)
+        jacobian = self._jacobian[: 3 * count].reshape(3, count)
+        # The channel-first warp is C-contiguous, so one take fills the input,
+        # x-gradient, and y-gradient rows without three separate traversals.
+        np.take(
+            warped.reshape(3, -1),
+            valid_indices,
+            axis=1,
+            out=jacobian,
+            mode="clip",
+        )
+        input_values = jacobian[0]
         np.subtract(
-            sample,
-            np.mean(sample, dtype=np.float64),
+            input_values,
+            np.mean(input_values, dtype=np.float64),
             out=input_zero_mean,
         )
 
         # Before it receives the promoted Jacobian, one row is a reusable
         # float64 reduction buffer for the three image statistics.
-        arithmetic = self._projection_jacobian[0, :count]
+        projection_jacobian = self._projection_jacobian[: 3 * count].reshape(
+            3,
+            count,
+        )
+        arithmetic = projection_jacobian[0]
         np.multiply(template_zero_mean, template_zero_mean, out=arithmetic)
         template_norm_squared = float(np.sum(arithmetic, dtype=np.float64))
         np.multiply(input_zero_mean, input_zero_mean, out=arithmetic)
@@ -1165,7 +1184,6 @@ class _EccIterationWorkspace:
 
     def build_jacobians(
         self,
-        warped: np.ndarray,
         sine: np.float32,
         cosine: np.float32,
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -1187,12 +1205,10 @@ class _EccIterationWorkspace:
             casting="unsafe",
         )
 
-        jacobian = self._jacobian[:, :count]
+        jacobian = self._jacobian[: 3 * count].reshape(3, count)
         jacobian_theta = jacobian[0]
         jacobian_gradient_x = jacobian[1]
         jacobian_gradient_y = jacobian[2]
-        np.take(warped[:, :, 1], valid_indices, out=jacobian_gradient_x)
-        np.take(warped[:, :, 2], valid_indices, out=jacobian_gradient_y)
 
         # These in-place operations preserve the original float32 evaluation
         # order while avoiding several full-size coordinate temporaries.
@@ -1213,7 +1229,10 @@ class _EccIterationWorkspace:
         # Zero-mean vectors are float64, so mixed-dtype matrix products would
         # promote this same Jacobian afresh for every projection. Promote it
         # once per iteration and reuse the contiguous parameter-major copy.
-        projection_jacobian = self._projection_jacobian[:, :count]
+        projection_jacobian = self._projection_jacobian[: 3 * count].reshape(
+            3,
+            count,
+        )
         np.copyto(projection_jacobian, jacobian, casting="unsafe")
         return jacobian, projection_jacobian
 
@@ -1267,7 +1286,6 @@ def _find_transform_ecc_euclidean_core(
             sine = np.float32(sin(angle))
             cosine = np.float32(cos(angle))
             jacobian, projection_jacobian = iteration_workspace.build_jacobians(
-                warped,
                 sine,
                 cosine,
             )
