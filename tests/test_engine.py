@@ -468,12 +468,13 @@ def test_ecc_iteration_workspace_preserves_direct_array_math() -> None:
     rng = np.random.default_rng(307)
     height, width = 31, 43
     template = rng.random((height, width), dtype=np.float32)
-    warped = rng.normal(size=(height, width, 3)).astype(np.float32)
+    warped_hwc = rng.normal(size=(height, width, 3)).astype(np.float32)
+    warped = np.ascontiguousarray(np.moveaxis(warped_hwc, 2, 0))
     valid = rng.random((height, width)) > 0.17
     valid_y, valid_x = np.nonzero(valid)
 
     template_values = template[valid_y, valid_x]
-    input_values = warped[valid_y, valid_x, 0]
+    input_values = warped_hwc[valid_y, valid_x, 0]
     expected_template = template_values - np.mean(
         template_values,
         dtype=np.float64,
@@ -507,8 +508,8 @@ def test_ecc_iteration_workspace_preserves_direct_array_math() -> None:
     angle = np.float32(0.037)
     sine = np.float32(np.sin(angle))
     cosine = np.float32(np.cos(angle))
-    gradient_x = warped[valid_y, valid_x, 1]
-    gradient_y = warped[valid_y, valid_x, 2]
+    gradient_x = warped_hwc[valid_y, valid_x, 1]
+    gradient_y = warped_hwc[valid_y, valid_x, 2]
     expected_jacobian = np.empty((valid_x.size, 3), dtype=np.float32)
     x_coordinates = valid_x.astype(np.float32, copy=False)
     y_coordinates = valid_y.astype(np.float32, copy=False)
@@ -521,11 +522,12 @@ def test_ecc_iteration_workspace_preserves_direct_array_math() -> None:
     expected_jacobian[:, 2] = gradient_y
 
     jacobian, projection_jacobian = workspace.build_jacobians(
-        warped,
         sine,
         cosine,
     )
 
+    assert jacobian.flags.c_contiguous
+    assert projection_jacobian.flags.c_contiguous
     np.testing.assert_array_equal(jacobian.T, expected_jacobian)
     np.testing.assert_array_equal(
         projection_jacobian,
@@ -567,9 +569,11 @@ def test_pillow_ecc_warp_preserves_numpy_validity_and_border_sampling() -> None:
     )
 
     np.testing.assert_array_equal(actual_valid, expected_valid)
+    assert actual_warped.shape == (3, *actual_valid.shape)
+    assert actual_warped.flags.c_contiguous
     np.testing.assert_allclose(
-        actual_warped[actual_valid],
-        expected_warped[expected_valid],
+        actual_warped[:, actual_valid],
+        expected_warped[:, expected_valid],
         rtol=0,
         atol=2e-4,
     )
