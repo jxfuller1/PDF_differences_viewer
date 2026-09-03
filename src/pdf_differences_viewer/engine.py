@@ -1310,15 +1310,12 @@ class _EccIterationWorkspace:
             out=template_zero_mean,
         )
         jacobian = self._jacobian[: 3 * count].reshape(3, count)
-        # The channel-first warp is C-contiguous, so one take fills the input,
-        # x-gradient, and y-gradient rows without three separate traversals.
-        np.take(
-            warped.reshape(3, -1),
-            valid_indices,
-            axis=1,
-            out=jacobian,
-            mode="clip",
-        )
+        # A row-wise gather stays on NumPy's fast contiguous 1-D indexing path.
+        # Only one temporary channel is live at a time, and the destination is
+        # still the reusable parameter-major Jacobian buffer.
+        warped_channels = warped.reshape(3, -1)
+        for source_channel, destination_channel in zip(warped_channels, jacobian):
+            np.copyto(destination_channel, source_channel[valid_indices])
         input_values = jacobian[0]
         np.subtract(
             input_values,
