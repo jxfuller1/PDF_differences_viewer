@@ -579,6 +579,42 @@ def test_pillow_ecc_warp_preserves_numpy_validity_and_border_sampling() -> None:
     )
 
 
+def test_pillow_float_image_copy_uses_arrow_without_changing_pixels() -> None:
+    source = np.random.default_rng(811).normal(size=(37, 53)).astype(np.float32)
+    image = engine.Image.fromarray(source)
+    destination = np.empty_like(source)
+
+    used_arrow = engine._copy_pillow_float_image(image, destination)
+
+    np.testing.assert_array_equal(destination, source)
+    if (
+        hasattr(image, "__arrow_c_array__")
+        and engine._py_capsule_get_pointer is not None
+    ):
+        assert used_arrow
+
+
+def test_pillow_float_image_copy_falls_back_when_arrow_is_unavailable(
+    monkeypatch,
+) -> None:
+    source = np.random.default_rng(821).normal(size=(19, 31)).astype(np.float32)
+    image = engine.Image.fromarray(source)
+    destination = np.empty_like(source)
+
+    def unavailable(*_args, **_kwargs):
+        raise ValueError("Arrow export unavailable")
+
+    monkeypatch.setattr(
+        engine.Image.Image,
+        "__arrow_c_array__",
+        unavailable,
+        raising=False,
+    )
+
+    assert not engine._copy_pillow_float_image(image, destination)
+    np.testing.assert_array_equal(destination, source)
+
+
 def test_parallel_pillow_ecc_warp_matches_serial_output() -> None:
     rng = np.random.default_rng(419)
     source = rng.normal(size=(29, 41, 3)).astype(np.float32)
