@@ -206,12 +206,26 @@ def render_pdf_page(
             matrix=fitz.Matrix(dpi / 72.0, dpi / 72.0),
             alpha=False,
         )
-        rgb = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(pixmap.height, pixmap.width, pixmap.n)
+        # ``samples`` first copies the complete MuPDF raster into a Python
+        # ``bytes`` object.  The memoryview avoids that intermediate copy and
+        # remains valid while ``pixmap`` is alive.  Copy straight into the
+        # final BGRA allocation so rendering does not also build temporary BGR
+        # and alpha arrays for these large high-DPI pages.
+        sample_rows = np.frombuffer(pixmap.samples_mv, dtype=np.uint8).reshape(
+            pixmap.height,
+            pixmap.stride,
+        )
+        pixels = sample_rows[:, : pixmap.width * pixmap.n].reshape(
+            pixmap.height,
+            pixmap.width,
+            pixmap.n,
+        )
+        bgra = np.empty((pixmap.height, pixmap.width, 4), dtype=np.uint8)
         if pixmap.n == 1:
-            bgr = _gray_to_bgr(rgb[:, :, 0])
+            bgra[:, :, :3] = pixels
         else:
-            bgr = _rgb_to_bgr(rgb[:, :, :3])
-    bgra = _bgr_to_bgra(bgr)
+            bgra[:, :, :3] = pixels[:, :, 2::-1]
+        bgra[:, :, 3] = 255
     _progress(progress, "page rendered", 1.0)
     return RenderedPage(
         bgra=np.ascontiguousarray(bgra),
