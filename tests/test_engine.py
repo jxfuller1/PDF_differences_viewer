@@ -11,6 +11,7 @@ from pdf_differences_viewer.engine import (
     DifferenceRegion,
     EccConvergenceError,
     EccSettings,
+    _EccIterationWorkspace,
     _align_old_to_new,
     _bgr_to_bgra,
     _bgr_to_gray,
@@ -461,6 +462,75 @@ def test_numpy_ecc_preprocessing_matches_opencv_gaussian() -> None:
     actual = _gaussian_blur_5x5(image)
 
     np.testing.assert_allclose(actual, expected, rtol=0, atol=2e-7)
+
+
+def test_ecc_iteration_workspace_preserves_direct_array_math() -> None:
+    rng = np.random.default_rng(307)
+    height, width = 31, 43
+    template = rng.random((height, width), dtype=np.float32)
+    warped = rng.normal(size=(height, width, 3)).astype(np.float32)
+    valid = rng.random((height, width)) > 0.17
+    valid_y, valid_x = np.nonzero(valid)
+
+    template_values = template[valid_y, valid_x]
+    input_values = warped[valid_y, valid_x, 0]
+    expected_template = template_values - np.mean(
+        template_values,
+        dtype=np.float64,
+    )
+    expected_input = input_values - np.mean(input_values, dtype=np.float64)
+    expected_template_norm = float(
+        np.sum(expected_template * expected_template, dtype=np.float64)
+    )
+    expected_input_norm = float(
+        np.sum(expected_input * expected_input, dtype=np.float64)
+    )
+    expected_correlation = float(
+        np.sum(expected_template * expected_input, dtype=np.float64)
+    )
+
+    workspace = _EccIterationWorkspace(template.shape)
+    (
+        actual_template,
+        actual_input,
+        actual_template_norm,
+        actual_input_norm,
+        actual_correlation,
+    ) = workspace.prepare_values(template, warped, valid)
+
+    np.testing.assert_array_equal(actual_template, expected_template)
+    np.testing.assert_array_equal(actual_input, expected_input)
+    assert actual_template_norm == expected_template_norm
+    assert actual_input_norm == expected_input_norm
+    assert actual_correlation == expected_correlation
+
+    angle = np.float32(0.037)
+    sine = np.float32(np.sin(angle))
+    cosine = np.float32(np.cos(angle))
+    gradient_x = warped[valid_y, valid_x, 1]
+    gradient_y = warped[valid_y, valid_x, 2]
+    expected_jacobian = np.empty((valid_x.size, 3), dtype=np.float32)
+    x_coordinates = valid_x.astype(np.float32, copy=False)
+    y_coordinates = valid_y.astype(np.float32, copy=False)
+    expected_jacobian[:, 0] = gradient_x * (
+        -sine * x_coordinates - cosine * y_coordinates
+    ) + gradient_y * (
+        cosine * x_coordinates - sine * y_coordinates
+    )
+    expected_jacobian[:, 1] = gradient_x
+    expected_jacobian[:, 2] = gradient_y
+
+    jacobian, projection_jacobian = workspace.build_jacobians(
+        warped,
+        sine,
+        cosine,
+    )
+
+    np.testing.assert_array_equal(jacobian.T, expected_jacobian)
+    np.testing.assert_array_equal(
+        projection_jacobian,
+        expected_jacobian.T.astype(np.float64),
+    )
 
 
 def test_pillow_ecc_warp_preserves_numpy_validity_and_border_sampling() -> None:

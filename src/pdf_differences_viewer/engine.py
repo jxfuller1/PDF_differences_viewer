@@ -1095,6 +1095,129 @@ def _warp_ecc_channels(
         return warper.warp(matrix)
 
 
+class _EccIterationWorkspace:
+    """Reuse the large arrays needed by every Euclidean ECC iteration."""
+
+    def __init__(self, shape: tuple[int, int]) -> None:
+        height, width = shape
+        maximum_pixels = height * width
+        self._width = width
+        self._sample = np.empty(maximum_pixels, dtype=np.float32)
+        self._template_zero_mean = np.empty(maximum_pixels, dtype=np.float64)
+        self._input_zero_mean = np.empty(maximum_pixels, dtype=np.float64)
+        self._x_coordinates = np.empty(maximum_pixels, dtype=np.float32)
+        self._y_coordinates = np.empty(maximum_pixels, dtype=np.float32)
+        self._jacobian = np.empty((3, maximum_pixels), dtype=np.float32)
+        self._projection_jacobian = np.empty(
+            (3, maximum_pixels),
+            dtype=np.float64,
+        )
+        self._valid_indices: np.ndarray | None = None
+        self._valid_count = 0
+
+    def prepare_values(
+        self,
+        template: np.ndarray,
+        warped: np.ndarray,
+        valid: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, float, float, float]:
+        """Gather valid pixels and calculate their zero-mean statistics."""
+
+        valid_indices = np.flatnonzero(valid)
+        count = int(valid_indices.size)
+        if count < EccSettings.MIN_VALID_PIXELS:
+            raise EccConvergenceError("ECC has too little overlapping image area")
+        self._valid_indices = valid_indices
+        self._valid_count = count
+
+        sample = self._sample[:count]
+        template_zero_mean = self._template_zero_mean[:count]
+        input_zero_mean = self._input_zero_mean[:count]
+        np.take(template, valid_indices, out=sample)
+        np.subtract(
+            sample,
+            np.mean(sample, dtype=np.float64),
+            out=template_zero_mean,
+        )
+        np.take(warped[:, :, 0], valid_indices, out=sample)
+        np.subtract(
+            sample,
+            np.mean(sample, dtype=np.float64),
+            out=input_zero_mean,
+        )
+
+        # Before it receives the promoted Jacobian, one row is a reusable
+        # float64 reduction buffer for the three image statistics.
+        arithmetic = self._projection_jacobian[0, :count]
+        np.multiply(template_zero_mean, template_zero_mean, out=arithmetic)
+        template_norm_squared = float(np.sum(arithmetic, dtype=np.float64))
+        np.multiply(input_zero_mean, input_zero_mean, out=arithmetic)
+        input_norm_squared = float(np.sum(arithmetic, dtype=np.float64))
+        np.multiply(template_zero_mean, input_zero_mean, out=arithmetic)
+        correlation = float(np.sum(arithmetic, dtype=np.float64))
+        return (
+            template_zero_mean,
+            input_zero_mean,
+            template_norm_squared,
+            input_norm_squared,
+            correlation,
+        )
+
+    def build_jacobians(
+        self,
+        warped: np.ndarray,
+        sine: np.float32,
+        cosine: np.float32,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build contiguous parameter rows for the current valid pixels."""
+
+        valid_indices = self._valid_indices
+        if valid_indices is None:
+            raise RuntimeError("ECC values must be prepared before its Jacobian")
+        count = self._valid_count
+        x_coordinates = self._x_coordinates[:count]
+        y_coordinates = self._y_coordinates[:count]
+        # The sampling buffer is dead after ``prepare_values`` and can now be
+        # reused for the Euclidean coordinate products.
+        coordinate_scratch = self._sample[:count]
+        np.divmod(
+            valid_indices,
+            self._width,
+            out=(y_coordinates, x_coordinates),
+            casting="unsafe",
+        )
+
+        jacobian = self._jacobian[:, :count]
+        jacobian_theta = jacobian[0]
+        jacobian_gradient_x = jacobian[1]
+        jacobian_gradient_y = jacobian[2]
+        np.take(warped[:, :, 1], valid_indices, out=jacobian_gradient_x)
+        np.take(warped[:, :, 2], valid_indices, out=jacobian_gradient_y)
+
+        # These in-place operations preserve the original float32 evaluation
+        # order while avoiding several full-size coordinate temporaries.
+        np.multiply(cosine, x_coordinates, out=jacobian_theta)
+        np.multiply(sine, y_coordinates, out=coordinate_scratch)
+        np.subtract(jacobian_theta, coordinate_scratch, out=jacobian_theta)
+        np.multiply(-sine, x_coordinates, out=x_coordinates)
+        np.multiply(cosine, y_coordinates, out=coordinate_scratch)
+        np.subtract(x_coordinates, coordinate_scratch, out=x_coordinates)
+        np.multiply(jacobian_gradient_x, x_coordinates, out=x_coordinates)
+        np.multiply(
+            jacobian_gradient_y,
+            jacobian_theta,
+            out=coordinate_scratch,
+        )
+        np.add(x_coordinates, coordinate_scratch, out=jacobian_theta)
+
+        # Zero-mean vectors are float64, so mixed-dtype matrix products would
+        # promote this same Jacobian afresh for every projection. Promote it
+        # once per iteration and reuse the contiguous parameter-major copy.
+        projection_jacobian = self._projection_jacobian[:, :count]
+        np.copyto(projection_jacobian, jacobian, casting="unsafe")
+        return jacobian, projection_jacobian
+
+
 def _find_transform_ecc_euclidean_core(
     template: np.ndarray,
     input_image: np.ndarray,
@@ -1116,6 +1239,7 @@ def _find_transform_ecc_euclidean_core(
     destination_x = np.arange(width, dtype=np.float32)[np.newaxis, :]
     destination_y = np.arange(height, dtype=np.float32)[:, np.newaxis]
     matrix = np.asarray(initial_matrix, dtype=np.float32).reshape(2, 3).copy()
+    iteration_workspace = _EccIterationWorkspace(template_blurred.shape)
     rho = -1.0
     with _EccChannelWarper(
         padded_channels,
@@ -1126,31 +1250,15 @@ def _find_transform_ecc_euclidean_core(
         for _ in range(max_iterations):
             last_rho = rho
             warped, valid = warper.warp(matrix)
-            valid_y, valid_x = np.nonzero(valid)
-            if valid_x.size < EccSettings.MIN_VALID_PIXELS:
-                raise EccConvergenceError("ECC has too little overlapping image area")
-
-            template_values = template_blurred[valid_y, valid_x]
-            input_values = warped[valid_y, valid_x, 0]
-            template_zero_mean = template_values - np.mean(
-                template_values,
-                dtype=np.float64,
-            )
-            input_zero_mean = input_values - np.mean(
-                input_values,
-                dtype=np.float64,
-            )
-            template_norm_squared = float(
-                np.sum(template_zero_mean * template_zero_mean, dtype=np.float64)
-            )
-            input_norm_squared = float(
-                np.sum(input_zero_mean * input_zero_mean, dtype=np.float64)
-            )
+            (
+                template_zero_mean,
+                input_zero_mean,
+                template_norm_squared,
+                input_norm_squared,
+                correlation,
+            ) = iteration_workspace.prepare_values(template_blurred, warped, valid)
             if template_norm_squared <= 0.0 or input_norm_squared <= 0.0:
                 raise EccConvergenceError("ECC cannot align a uniform image")
-            correlation = float(
-                np.sum(template_zero_mean * input_zero_mean, dtype=np.float64)
-            )
             rho = correlation / np.sqrt(template_norm_squared * input_norm_squared)
             if not np.isfinite(rho):
                 raise EccConvergenceError("ECC correlation became non-finite")
@@ -1158,22 +1266,15 @@ def _find_transform_ecc_euclidean_core(
             angle = asin(float(np.clip(matrix[1, 0], -1.0, 1.0)))
             sine = np.float32(sin(angle))
             cosine = np.float32(cos(angle))
-            x_coordinates = valid_x.astype(np.float32, copy=False)
-            y_coordinates = valid_y.astype(np.float32, copy=False)
-            warped_gradient_x = warped[valid_y, valid_x, 1]
-            warped_gradient_y = warped[valid_y, valid_x, 2]
-            jacobian = np.empty((valid_x.size, 3), dtype=np.float32)
-            jacobian[:, 0] = warped_gradient_x * (
-                -sine * x_coordinates - cosine * y_coordinates
-            ) + warped_gradient_y * (
-                cosine * x_coordinates - sine * y_coordinates
+            jacobian, projection_jacobian = iteration_workspace.build_jacobians(
+                warped,
+                sine,
+                cosine,
             )
-            jacobian[:, 1] = warped_gradient_x
-            jacobian[:, 2] = warped_gradient_y
 
-            hessian = jacobian.T @ jacobian
-            image_projection = jacobian.T @ input_zero_mean
-            template_projection = jacobian.T @ template_zero_mean
+            hessian = jacobian @ jacobian.T
+            image_projection = projection_jacobian @ input_zero_mean
+            template_projection = projection_jacobian @ template_zero_mean
             try:
                 image_projection_hessian = np.linalg.solve(hessian, image_projection)
             except np.linalg.LinAlgError as exc:
@@ -1189,8 +1290,19 @@ def _find_transform_ecc_euclidean_core(
                     "ECC images are uncorrelated or non-overlapping"
                 )
             illumination_scale = lambda_numerator / lambda_denominator
-            error = illumination_scale * template_zero_mean - input_zero_mean
-            error_projection = jacobian.T @ error
+            # The template vector is dead after its projection, so it can hold
+            # the error without allocating two more float64 arrays.
+            np.multiply(
+                illumination_scale,
+                template_zero_mean,
+                out=template_zero_mean,
+            )
+            np.subtract(
+                template_zero_mean,
+                input_zero_mean,
+                out=template_zero_mean,
+            )
+            error_projection = projection_jacobian @ template_zero_mean
             try:
                 delta = np.linalg.solve(hessian, error_projection)
             except np.linalg.LinAlgError as exc:
