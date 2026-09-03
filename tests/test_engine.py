@@ -398,6 +398,61 @@ def test_numpy_phase_correlate_matches_opencv_shift_and_response() -> None:
         np.testing.assert_allclose(actual_response, expected_response, rtol=0, atol=2e-5)
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_parallel_phase_spectra_preserve_sequential_results(
+    monkeypatch,
+    dtype,
+) -> None:
+    rng = np.random.default_rng(809)
+    first = rng.normal(size=(73, 91)).astype(dtype)
+    second = np.roll(first, shift=(5, -9), axis=(0, 1))
+
+    monkeypatch.setattr(
+        engine.PhaseCorrelationSettings,
+        "PARALLEL_FORWARD_MIN_PIXELS",
+        first.size * 10,
+    )
+    sequential = _phase_correlate(first, second)
+    monkeypatch.setattr(engine, "cpu_count", lambda: 2)
+    monkeypatch.setattr(
+        engine.PhaseCorrelationSettings,
+        "PARALLEL_FORWARD_MIN_PIXELS",
+        0,
+    )
+    parallel = _phase_correlate(first, second)
+
+    assert parallel == sequential
+    expected_shift, expected_response = cv2.phaseCorrelate(first, second)
+    np.testing.assert_allclose(parallel[0], expected_shift, rtol=0, atol=5e-3)
+    np.testing.assert_allclose(parallel[1], expected_response, rtol=0, atol=2e-5)
+
+
+def test_phase_spectra_fall_back_when_threads_are_unavailable(monkeypatch) -> None:
+    rng = np.random.default_rng(821)
+    first = rng.normal(size=(67, 89)).astype(np.float32)
+    second = np.roll(first, shift=(-4, 7), axis=(0, 1))
+    monkeypatch.setattr(
+        engine.PhaseCorrelationSettings,
+        "PARALLEL_FORWARD_MIN_PIXELS",
+        first.size * 10,
+    )
+    expected = _phase_correlate(first, second)
+
+    class UnavailableExecutor:
+        def __init__(self, **_kwargs) -> None:
+            raise RuntimeError("worker threads unavailable")
+
+    monkeypatch.setattr(engine, "ThreadPoolExecutor", UnavailableExecutor)
+    monkeypatch.setattr(engine, "cpu_count", lambda: 2)
+    monkeypatch.setattr(
+        engine.PhaseCorrelationSettings,
+        "PARALLEL_FORWARD_MIN_PIXELS",
+        0,
+    )
+
+    assert _phase_correlate(first, second) == expected
+
+
 def test_numpy_ecc_preprocessing_matches_opencv_gaussian() -> None:
     rng = np.random.default_rng(101)
     image = rng.random((53, 71), dtype=np.float32)
