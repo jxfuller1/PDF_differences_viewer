@@ -11,6 +11,7 @@ from pdf_differences_viewer.engine import (
     DifferenceRegion,
     EccConvergenceError,
     EccSettings,
+    InkMaskSettings,
     _EccIterationWorkspace,
     _align_old_to_new,
     _bgr_to_bgra,
@@ -61,6 +62,31 @@ def test_numpy_channel_conversions_preserve_expected_color_layout() -> None:
     bgra = _bgr_to_bgra(bgr)
     np.testing.assert_array_equal(bgra[:, :, :3], bgr)
     assert np.all(bgra[:, :, 3] == 255)
+
+
+def test_bgr_to_gray_matches_legacy_integer_arithmetic() -> None:
+    rng = np.random.default_rng(887)
+    bgra = rng.integers(0, 256, size=(137, 251, 4), dtype=np.uint8)
+
+    def legacy(source: np.ndarray) -> np.ndarray:
+        channels = source.astype(np.uint32, copy=False)
+        return (
+            (
+                channels[:, :, 2] * InkMaskSettings.RED_WEIGHT
+                + channels[:, :, 1] * InkMaskSettings.GREEN_WEIGHT
+                + channels[:, :, 0] * InkMaskSettings.BLUE_WEIGHT
+                + InkMaskSettings.LUMA_ROUNDING
+            )
+            // InkMaskSettings.LUMA_SCALE
+        ).astype(np.uint8)
+
+    np.testing.assert_array_equal(_bgr_to_gray(bgra), legacy(bgra))
+    np.testing.assert_array_equal(
+        _bgr_to_gray(bgra[::2, ::3]),
+        legacy(bgra[::2, ::3]),
+    )
+    non_integer = bgra[:, :, :3].astype(np.float32) + np.float32(0.75)
+    np.testing.assert_array_equal(_bgr_to_gray(non_integer), legacy(non_integer))
 
 
 def _ink_mask_oracle(image: np.ndarray, threshold: int) -> np.ndarray:
