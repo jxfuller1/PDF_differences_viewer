@@ -42,6 +42,19 @@ class AffineWarpSettings:
     MAX_GUARDED_PIXEL_FRACTION = 0.25
 
 
+class InkMaskSettings:
+    """Exact BT.601 mask constants and color-path dispatch limits."""
+
+    BLUE_WEIGHT = 114
+    GREEN_WEIGHT = 587
+    RED_WEIGHT = 299
+    LUMA_SCALE = 1000
+    LUMA_ROUNDING = 500
+    CHUNK_ROWS = 128
+    COLOR_SAMPLE_STRIDE = 32
+    SPARSE_COLOR_MAX_FRACTION = 0.03
+
+
 class AlignmentSettings:
     """Conservative settings for deciding whether ECC is worth attempting."""
 
@@ -237,8 +250,13 @@ def _bgr_to_gray(bgr: np.ndarray) -> np.ndarray:
     """Convert BGR to luma with the standard BT.601 integer coefficients."""
     channels = bgr.astype(np.uint32, copy=False)
     return (
-        (channels[:, :, 2] * 299 + channels[:, :, 1] * 587 + channels[:, :, 0] * 114 + 500)
-        // 1000
+        (
+            channels[:, :, 2] * InkMaskSettings.RED_WEIGHT
+            + channels[:, :, 1] * InkMaskSettings.GREEN_WEIGHT
+            + channels[:, :, 0] * InkMaskSettings.BLUE_WEIGHT
+            + InkMaskSettings.LUMA_ROUNDING
+        )
+        // InkMaskSettings.LUMA_SCALE
     ).astype(np.uint8)
 
 
@@ -469,10 +487,119 @@ def _warp_bgr_affine_numpy(
     return output
 
 
+def _threshold_gray_channel(gray: np.ndarray, ink_threshold: int) -> np.ndarray:
+    """Return a zero/255 mask while writing the comparison directly to uint8."""
+    result = np.empty(gray.shape, dtype=np.uint8)
+    np.less(gray, ink_threshold, out=result)
+    np.multiply(result, 255, out=result)
+    return result
+
+
+def _weighted_ink_mask(bgr: np.ndarray, ink_threshold: int) -> np.ndarray:
+    """Threshold exact BT.601 luma in cache-sized chunks without a gray image."""
+    height, width = bgr.shape[:2]
+    result = np.empty((height, width), dtype=np.uint8)
+    working_rows = min(InkMaskSettings.CHUNK_ROWS, height)
+    weighted = np.empty((working_rows, width), dtype=np.uint32)
+    scratch = np.empty_like(weighted)
+    threshold_sum = np.uint32(
+        ink_threshold * InkMaskSettings.LUMA_SCALE - InkMaskSettings.LUMA_ROUNDING
+    )
+
+    for start in range(0, height, InkMaskSettings.CHUNK_ROWS):
+        stop = min(start + InkMaskSettings.CHUNK_ROWS, height)
+        row_count = stop - start
+        score = weighted[:row_count]
+        temporary = scratch[:row_count]
+        source = bgr[start:stop]
+        np.multiply(
+            source[:, :, 2],
+            InkMaskSettings.RED_WEIGHT,
+            dtype=np.uint32,
+            out=score,
+        )
+        np.multiply(
+            source[:, :, 1],
+            InkMaskSettings.GREEN_WEIGHT,
+            dtype=np.uint32,
+            out=temporary,
+        )
+        np.add(score, temporary, out=score)
+        np.multiply(
+            source[:, :, 0],
+            InkMaskSettings.BLUE_WEIGHT,
+            dtype=np.uint32,
+            out=temporary,
+        )
+        np.add(score, temporary, out=score)
+        output = result[start:stop]
+        np.less(score, threshold_sum, out=output)
+        np.multiply(output, 255, out=output)
+    return result
+
+
+def _sparse_color_ink_mask(bgr: np.ndarray, ink_threshold: int) -> np.ndarray | None:
+    """Use one gray channel for a mostly monochrome page and repair color pixels."""
+    blue, green, red = bgr[:, :, 0], bgr[:, :, 1], bgr[:, :, 2]
+    colored = np.empty(bgr.shape[:2], dtype=bool)
+    result = np.empty(bgr.shape[:2], dtype=np.uint8)
+    np.not_equal(blue, green, out=colored)
+    np.not_equal(blue, red, out=result)
+    np.logical_or(colored, result, out=colored)
+    colored_count = int(np.count_nonzero(colored))
+    if colored_count > colored.size * InkMaskSettings.SPARSE_COLOR_MAX_FRACTION:
+        return None
+
+    np.less(blue, ink_threshold, out=result)
+    np.multiply(result, 255, out=result)
+    if not colored_count:
+        return result
+
+    colored_indices = np.flatnonzero(colored)
+    pixels = bgr.reshape(-1, bgr.shape[2])[colored_indices]
+    weighted = pixels[:, 2].astype(np.uint32)
+    np.multiply(weighted, InkMaskSettings.RED_WEIGHT, out=weighted)
+    weighted += pixels[:, 1].astype(np.uint32) * InkMaskSettings.GREEN_WEIGHT
+    weighted += pixels[:, 0].astype(np.uint32) * InkMaskSettings.BLUE_WEIGHT
+    colored_result = np.empty(colored_count, dtype=np.uint8)
+    np.less(
+        weighted,
+        ink_threshold * InkMaskSettings.LUMA_SCALE - InkMaskSettings.LUMA_ROUNDING,
+        out=colored_result,
+    )
+    np.multiply(colored_result, 255, out=colored_result)
+    result.ravel()[colored_indices] = colored_result
+    return result
+
+
 def _ink_mask(bgr: np.ndarray, ink_threshold: int) -> np.ndarray:
     """Mark non-paper pixels.  White/near-white pages remain safely empty."""
-    gray = _bgr_to_gray(bgr)
-    return np.where(gray < ink_threshold, 255, 0).astype(np.uint8)
+    if bgr.dtype != np.uint8 or not isinstance(ink_threshold, (int, np.integer)):
+        return _threshold_gray_channel(_bgr_to_gray(bgr), ink_threshold)
+    if ink_threshold <= 0:
+        return np.zeros(bgr.shape[:2], dtype=np.uint8)
+    if ink_threshold > 255:
+        return np.full(bgr.shape[:2], 255, dtype=np.uint8)
+
+    stride = InkMaskSettings.COLOR_SAMPLE_STRIDE
+    sample = bgr[::stride, ::stride]
+    sample_colored = (sample[:, :, 0] != sample[:, :, 1]) | (
+        sample[:, :, 0] != sample[:, :, 2]
+    )
+    sampled_color_count = int(np.count_nonzero(sample_colored))
+    if sampled_color_count == 0 and np.array_equal(
+        bgr[:, :, 0], bgr[:, :, 1]
+    ) and np.array_equal(bgr[:, :, 0], bgr[:, :, 2]):
+        return _threshold_gray_channel(bgr[:, :, 0], ink_threshold)
+
+    if (
+        sampled_color_count
+        <= sample_colored.size * InkMaskSettings.SPARSE_COLOR_MAX_FRACTION
+    ):
+        sparse_result = _sparse_color_ink_mask(bgr, ink_threshold)
+        if sparse_result is not None:
+            return sparse_result
+    return _weighted_ink_mask(bgr, ink_threshold)
 
 
 def _coarse_gray(image: np.ndarray) -> np.ndarray:
