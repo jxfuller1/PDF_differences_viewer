@@ -8,6 +8,7 @@ small rasterisation shifts therefore do not become differences.
 
 from __future__ import annotations
 
+import ctypes
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -927,6 +928,128 @@ def _prepare_ecc_channel_images(
     )
 
 
+class _ArrowSchema(ctypes.Structure):
+    """ABI-stable Arrow C Data Interface schema header."""
+
+
+_ArrowSchema._fields_ = [
+    ("format", ctypes.c_char_p),
+    ("name", ctypes.c_char_p),
+    ("metadata", ctypes.c_char_p),
+    ("flags", ctypes.c_int64),
+    ("n_children", ctypes.c_int64),
+    ("children", ctypes.c_void_p),
+    ("dictionary", ctypes.c_void_p),
+    ("release", ctypes.c_void_p),
+    ("private_data", ctypes.c_void_p),
+]
+
+
+class _ArrowArray(ctypes.Structure):
+    """ABI-stable Arrow C Data Interface array header."""
+
+
+_ArrowArray._fields_ = [
+    ("length", ctypes.c_int64),
+    ("null_count", ctypes.c_int64),
+    ("offset", ctypes.c_int64),
+    ("n_buffers", ctypes.c_int64),
+    ("n_children", ctypes.c_int64),
+    ("buffers", ctypes.POINTER(ctypes.c_void_p)),
+    ("children", ctypes.c_void_p),
+    ("dictionary", ctypes.c_void_p),
+    ("release", ctypes.c_void_p),
+    ("private_data", ctypes.c_void_p),
+]
+
+try:
+    _py_capsule_get_pointer = ctypes.pythonapi.PyCapsule_GetPointer
+except AttributeError:  # Non-CPython runtimes retain the array-interface path.
+    _py_capsule_get_pointer = None
+else:
+    _py_capsule_get_pointer.argtypes = (ctypes.py_object, ctypes.c_char_p)
+    _py_capsule_get_pointer.restype = ctypes.c_void_p
+
+
+def _copy_pillow_float_image(
+    image: Image.Image,
+    destination: np.ndarray,
+) -> bool:
+    """Copy a mode-F image through Arrow when Pillow exposes zero-copy data.
+
+    Pillow 11.2.1 and newer can export its contiguous pixel allocation through
+    the ABI-stable Arrow C Data Interface.  Reading that buffer directly avoids
+    ``Image.__array_interface__`` serializing the complete image to ``bytes``
+    before NumPy can copy it.  The capsules stay alive through ``np.copyto``;
+    older Pillow builds and unsupported allocations retain the exact existing
+    array-interface path.
+    """
+    export_arrow = getattr(image, "__arrow_c_array__", None)
+    if (
+        image.mode == "F"
+        and callable(export_arrow)
+        and _py_capsule_get_pointer is not None
+    ):
+        try:
+            schema_capsule, array_capsule = export_arrow()
+            schema_pointer = _py_capsule_get_pointer(
+                schema_capsule,
+                b"arrow_schema",
+            )
+            array_pointer = _py_capsule_get_pointer(
+                array_capsule,
+                b"arrow_array",
+            )
+            if not schema_pointer or not array_pointer:
+                raise ValueError("Arrow export did not return valid capsules")
+            arrow_schema = ctypes.cast(
+                schema_pointer,
+                ctypes.POINTER(_ArrowSchema),
+            ).contents
+            arrow_array = ctypes.cast(
+                array_pointer,
+                ctypes.POINTER(_ArrowArray),
+            ).contents
+            if (
+                arrow_schema.format != b"f"
+                or arrow_schema.n_children != 0
+                or arrow_array.length != destination.size
+                or arrow_array.null_count != 0
+                or arrow_array.offset < 0
+                or arrow_array.n_buffers < 2
+                or arrow_array.n_children != 0
+                or not arrow_array.buffers
+                or not arrow_array.buffers[1]
+            ):
+                raise ValueError("unsupported Pillow Arrow array layout")
+            data_address = int(arrow_array.buffers[1]) + (
+                int(arrow_array.offset) * ctypes.sizeof(ctypes.c_float)
+            )
+            values = (ctypes.c_float * destination.size).from_address(
+                data_address,
+            )
+            source = np.ctypeslib.as_array(values).reshape(destination.shape)
+            np.copyto(destination, source)
+            # Keep both capsules referenced until after the shared pixels have
+            # been copied. Their destructors release Pillow's exported view.
+            _ = schema_capsule, array_capsule
+            return True
+        except (
+            AttributeError,
+            BufferError,
+            ctypes.ArgumentError,
+            OSError,
+            OverflowError,
+            RuntimeError,
+            SystemError,
+            TypeError,
+            ValueError,
+        ):
+            pass
+    np.copyto(destination, np.asarray(image))
+    return False
+
+
 def _warp_ecc_channels_pillow(
     padded_channels: np.ndarray,
     source_shape: tuple[int, int],
@@ -957,7 +1080,7 @@ def _warp_ecc_channels_pillow(
         )
         # Every task owns one disjoint channel plane. Copying here keeps the
         # Pillow-to-NumPy conversion parallel and avoids a later stack copy.
-        np.copyto(warped[index], np.asarray(transformed))
+        _copy_pillow_float_image(transformed, warped[index])
 
     if executor is None:
         for item in enumerate(source_images):
