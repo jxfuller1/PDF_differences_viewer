@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
 from math import asin, atan2, cos, degrees, hypot, sin
+from os import cpu_count
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -90,6 +91,7 @@ class PhaseCorrelationSettings:
 
     OPTIMAL_DFT_FACTORS = (2, 3, 5)
     CENTROID_RADIUS = 2
+    PARALLEL_FORWARD_MIN_PIXELS = 300_000
 
 
 class DistanceTransformSettings:
@@ -630,6 +632,41 @@ def _optimal_dft_size(size: int) -> int:
         candidate += 1
 
 
+def _phase_forward_spectra(
+    first: np.ndarray,
+    second: np.ndarray,
+    padded_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Transform two read-only phase inputs, concurrently when worthwhile."""
+
+    def transform(image: np.ndarray) -> np.ndarray:
+        return np.fft.rfft2(image, s=padded_shape, axes=(-2, -1))
+
+    padded_pixels = padded_shape[0] * padded_shape[1]
+    if (
+        padded_pixels < PhaseCorrelationSettings.PARALLEL_FORWARD_MIN_PIXELS
+        or (cpu_count() or 1) < 2
+    ):
+        return transform(first), transform(second)
+
+    executor: ThreadPoolExecutor | None = None
+    try:
+        executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="pdf-phase-fft",
+        )
+        first_future = executor.submit(transform, first)
+        second_future = executor.submit(transform, second)
+    except (OSError, RuntimeError):
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        return transform(first), transform(second)
+    try:
+        return first_future.result(), second_future.result()
+    finally:
+        executor.shutdown()
+
+
 def _phase_correlate(
     first: np.ndarray,
     second: np.ndarray,
@@ -654,15 +691,26 @@ def _phase_correlate(
     padded_height = _optimal_dft_size(first.shape[0])
     padded_width = _optimal_dft_size(first.shape[1])
     padded_shape = (padded_height, padded_width)
-    first_spectrum = np.fft.rfft2(first, s=padded_shape, axes=(-2, -1))
-    second_spectrum = np.fft.rfft2(second, s=padded_shape, axes=(-2, -1))
+    first_spectrum, second_spectrum = _phase_forward_spectra(
+        first,
+        second,
+        padded_shape,
+    )
     np.conjugate(second_spectrum, out=second_spectrum)
     np.multiply(first_spectrum, second_spectrum, out=first_spectrum)
 
-    magnitude = np.abs(first_spectrum)
+    # The second spectrum is dead after forming the cross-power product. Its
+    # complex storage holds exactly two real arrays, so reuse those contiguous
+    # halves for magnitude and normalization instead of allocating both.
+    real_dtype = first_spectrum.real.dtype
+    workspace = second_spectrum.view(real_dtype).reshape(-1)
+    spectrum_size = first_spectrum.size
+    magnitude = workspace[:spectrum_size].reshape(first_spectrum.shape)
+    normalizer = workspace[spectrum_size:].reshape(first_spectrum.shape)
+    np.abs(first_spectrum, out=magnitude)
     floating_info = np.finfo(first.dtype)
     # P * |P| / (|P|**2 + epsilon), rearranged to avoid overflow.
-    normalizer = np.maximum(magnitude, floating_info.tiny)
+    np.maximum(magnitude, floating_info.tiny, out=normalizer)
     np.divide(floating_info.eps, normalizer, out=normalizer)
     np.add(normalizer, magnitude, out=normalizer)
     np.divide(first_spectrum, normalizer, out=first_spectrum)
