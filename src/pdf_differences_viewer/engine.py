@@ -50,6 +50,11 @@ class InkMaskSettings:
     BLUE_WEIGHT = 114
     GREEN_WEIGHT = 587
     RED_WEIGHT = 299
+    BGR_LUMA_WEIGHTS = np.array(
+        (BLUE_WEIGHT, GREEN_WEIGHT, RED_WEIGHT),
+        dtype=np.uint32,
+    )
+    BGR_LUMA_WEIGHTS.setflags(write=False)
     LUMA_SCALE = 1000
     LUMA_ROUNDING = 500
     CHUNK_ROWS = 128
@@ -265,16 +270,18 @@ def _bgr_to_bgra(bgr: np.ndarray) -> np.ndarray:
 
 def _bgr_to_gray(bgr: np.ndarray) -> np.ndarray:
     """Convert BGR to luma with the standard BT.601 integer coefficients."""
-    channels = bgr.astype(np.uint32, copy=False)
-    return (
-        (
-            channels[:, :, 2] * InkMaskSettings.RED_WEIGHT
-            + channels[:, :, 1] * InkMaskSettings.GREEN_WEIGHT
-            + channels[:, :, 0] * InkMaskSettings.BLUE_WEIGHT
-            + InkMaskSettings.LUMA_ROUNDING
-        )
-        // InkMaskSettings.LUMA_SCALE
-    ).astype(np.uint8)
+    channels = bgr[:, :, :3]
+    if channels.dtype != np.uint8:
+        channels = channels.astype(np.uint32, copy=False)
+    weighted = np.einsum(
+        "ijk,k->ij",
+        channels,
+        InkMaskSettings.BGR_LUMA_WEIGHTS,
+        optimize=False,
+    )
+    np.add(weighted, InkMaskSettings.LUMA_ROUNDING, out=weighted)
+    np.floor_divide(weighted, InkMaskSettings.LUMA_SCALE, out=weighted)
+    return weighted.astype(np.uint8)
 
 
 def _resize_bgr(image: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
