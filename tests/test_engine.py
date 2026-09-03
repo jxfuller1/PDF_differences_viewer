@@ -579,6 +579,46 @@ def test_pillow_ecc_warp_preserves_numpy_validity_and_border_sampling() -> None:
     )
 
 
+def test_parallel_pillow_ecc_warp_matches_serial_output() -> None:
+    rng = np.random.default_rng(419)
+    source = rng.normal(size=(29, 41, 3)).astype(np.float32)
+    padded = np.pad(source, ((1, 1), (1, 1), (0, 0)), mode="constant")
+    source_images = engine._prepare_ecc_channel_images(padded)
+    angle = np.deg2rad(0.45)
+    matrix = np.array(
+        [
+            [np.cos(angle), -np.sin(angle), -0.3],
+            [np.sin(angle), np.cos(angle), 0.55],
+        ],
+        dtype=np.float32,
+    )
+    destination_x = np.arange(source.shape[1], dtype=np.float32)[np.newaxis, :]
+    destination_y = np.arange(source.shape[0], dtype=np.float32)[:, np.newaxis]
+
+    expected = engine._warp_ecc_channels_pillow(
+        padded,
+        source.shape[:2],
+        matrix,
+        destination_x,
+        destination_y,
+        source_images,
+        None,
+    )
+    with engine.ThreadPoolExecutor(max_workers=3) as executor:
+        actual = engine._warp_ecc_channels_pillow(
+            padded,
+            source.shape[:2],
+            matrix,
+            destination_x,
+            destination_y,
+            source_images,
+            executor,
+        )
+
+    np.testing.assert_array_equal(actual[0], expected[0])
+    np.testing.assert_array_equal(actual[1], expected[1])
+
+
 def test_pillow_ecc_warp_falls_back_to_numpy(monkeypatch) -> None:
     source = np.arange(7 * 9 * 3, dtype=np.float32).reshape(7, 9, 3)
     padded = np.pad(source, ((1, 1), (1, 1), (0, 0)), mode="constant")

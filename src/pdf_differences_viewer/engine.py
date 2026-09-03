@@ -941,23 +941,36 @@ def _warp_ecc_channels_pillow(
     destination_height = destination_y.shape[0]
     destination_width = destination_x.shape[1]
     affine = _ecc_pillow_affine(matrix)
+    warped = np.empty(
+        (len(source_images), destination_height, destination_width),
+        dtype=np.float32,
+    )
 
-    def transform(image: Image.Image) -> Image.Image:
-        return image.transform(
+    def transform_channel(item: tuple[int, Image.Image]) -> None:
+        index, image = item
+        transformed = image.transform(
             (destination_width, destination_height),
             Image.Transform.AFFINE,
             affine,
             resample=Image.Resampling.BILINEAR,
             fillcolor=0.0,
         )
+        # Every task owns one disjoint channel plane. Copying here keeps the
+        # Pillow-to-NumPy conversion parallel and avoids a later stack copy.
+        np.copyto(warped[index], np.asarray(transformed))
 
     if executor is None:
-        transformed = tuple(transform(image) for image in source_images)
+        for item in enumerate(source_images):
+            transform_channel(item)
+        futures = ()
     else:
-        transformed = tuple(executor.map(transform, source_images))
-    # Channel-first storage makes each flattened channel contiguous and lets
-    # the iteration workspace gather all three channels in one operation.
-    warped = np.stack(tuple(np.asarray(image) for image in transformed), axis=0)
+        # Coordinate validity is independent of the sampled channel values.
+        # Start the compiled Pillow work first so NumPy can build the mask on
+        # this thread while the three channel transforms run in parallel.
+        futures = tuple(
+            executor.submit(transform_channel, item)
+            for item in enumerate(source_images)
+        )
 
     # Preserve the original nearest-coordinate validity rule exactly. Pillow's
     # nearest filter differs at a few half-pixel ties.
@@ -1010,7 +1023,15 @@ def _warp_ecc_channels_pillow(
         bottom += padded_channels[bottom_index, right_index] * fraction_x[:, np.newaxis]
         top *= (1.0 - fraction_y)[:, np.newaxis]
         top += bottom * fraction_y[:, np.newaxis]
-        warped[:, edge_y, edge_x] = top.T
+        repaired_edge = top.T
+    else:
+        repaired_edge = None
+
+    if futures:
+        for future in futures:
+            future.result()
+    if repaired_edge is not None:
+        warped[:, edge_y, edge_x] = repaired_edge
     return warped, valid
 
 
