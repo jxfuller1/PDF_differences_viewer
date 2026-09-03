@@ -62,6 +62,81 @@ def test_numpy_channel_conversions_preserve_expected_color_layout() -> None:
     assert np.all(bgra[:, :, 3] == 255)
 
 
+def _ink_mask_oracle(image: np.ndarray, threshold: int) -> np.ndarray:
+    return np.where(_bgr_to_gray(image) < threshold, 255, 0).astype(np.uint8)
+
+
+@pytest.mark.parametrize("threshold", [0, 1, 245, 255, 256])
+def test_ink_mask_matches_oracle_for_monochrome_pages(threshold: int) -> None:
+    image = np.full((19, 23, 3), 255, dtype=np.uint8)
+    image[2:8, 3:11] = 0
+    image[12, 17] = 245
+
+    actual = _ink_mask(image, threshold)
+
+    np.testing.assert_array_equal(actual, _ink_mask_oracle(image, threshold))
+    assert actual.dtype == np.uint8
+    assert actual.flags.c_contiguous
+
+
+def test_ink_mask_matches_oracle_for_sparse_off_grid_color() -> None:
+    image = np.full((37, 41, 3), 255, dtype=np.uint8)
+    # Keep colored pixels off the accelerated sampler's grid.
+    image[1, 2] = (0, 64, 255)
+    image[14, 27] = (240, 0, 240)
+    image[36, 40] = (10, 20, 30)
+
+    np.testing.assert_array_equal(_ink_mask(image, 245), _ink_mask_oracle(image, 245))
+
+
+@pytest.mark.parametrize("threshold", [1, 29, 76, 128, 245, 255])
+def test_ink_mask_matches_oracle_for_dense_color_and_ignores_bgra_alpha(
+    threshold: int,
+) -> None:
+    rng = np.random.default_rng(8128)
+    bgr = rng.integers(0, 256, size=(127, 131, 3), dtype=np.uint8)
+    alpha = rng.integers(0, 256, size=(127, 131, 1), dtype=np.uint8)
+    bgra = np.concatenate((bgr, alpha), axis=2)
+
+    actual = _ink_mask(bgra, threshold)
+
+    np.testing.assert_array_equal(actual, _ink_mask_oracle(bgra, threshold))
+    assert actual.flags.c_contiguous
+
+
+def test_ink_mask_accepts_non_contiguous_read_only_input() -> None:
+    base = np.full((28, 34, 3), 255, dtype=np.uint8)
+    base[::2, 1::3] = (0, 0, 0)
+    image = base[1:, 2:, :]
+    image.setflags(write=False)
+
+    actual = _ink_mask(image, 245)
+
+    np.testing.assert_array_equal(actual, _ink_mask_oracle(image, 245))
+    assert actual.flags.c_contiguous
+
+
+def test_ink_mask_non_uint8_uses_exact_gray_fallback() -> None:
+    image = np.array([[[0.0, 0.0, 0.0], [255.0, 255.0, 255.0]]], dtype=np.float32)
+
+    actual = _ink_mask(image, 245)
+
+    np.testing.assert_array_equal(actual, _ink_mask_oracle(image, 245))
+    assert actual.dtype == np.uint8
+    assert actual.flags.c_contiguous
+
+
+def test_ink_mask_fractional_threshold_preserves_previous_semantics() -> None:
+    values = np.array([0, 29, 30, 244, 245, 255], dtype=np.uint8)
+    image = np.repeat(values[np.newaxis, :, np.newaxis], 3, axis=2)
+
+    for threshold in (0.5, 29.5, 245.5):
+        np.testing.assert_array_equal(
+            _ink_mask(image, threshold),
+            _ink_mask_oracle(image, threshold),
+        )
+
+
 def test_pillow_resize_and_numpy_affine_warp_preserve_bgr_geometry() -> None:
     source = _blank(5, 5)
     source[2, 3] = (0, 0, 0)
