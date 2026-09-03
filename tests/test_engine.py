@@ -1092,3 +1092,31 @@ def test_pdf_pages_render_and_compare(tmp_path) -> None:
     assert rendered.width > 0 and rendered.height > 0
     assert rendered.bgra.shape[2] == 4
     assert result.added_pixels > 0
+
+
+def test_pdf_render_matches_legacy_channel_conversion(tmp_path) -> None:
+    pdf = tmp_path / "render-colors.pdf"
+    document = fitz.open()
+    page = document.new_page(width=73, height=51)
+    page.draw_rect(
+        fitz.Rect(5, 7, 49, 39),
+        color=(0.1, 0.6, 0.9),
+        fill=(0.9, 0.2, 0.4),
+        width=2.25,
+    )
+    document.save(pdf)
+    document.close()
+
+    with fitz.open(pdf) as source:
+        pixmap = source[0].get_pixmap(matrix=fitz.Matrix(4.0, 4.0), alpha=False)
+        rgb = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
+            pixmap.height,
+            pixmap.width,
+            pixmap.n,
+        )
+        expected = _bgr_to_bgra(_rgb_to_bgr(rgb[:, :, :3]))
+
+    rendered = render_pdf_page(pdf, dpi=288)
+
+    np.testing.assert_array_equal(rendered.bgra, expected)
+    assert rendered.bgra.flags.c_contiguous
