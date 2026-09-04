@@ -550,10 +550,86 @@ def test_numpy_ecc_preprocessing_matches_opencv_gaussian() -> None:
     rng = np.random.default_rng(101)
     image = rng.random((53, 71), dtype=np.float32)
 
+    source = np.asarray(image, dtype=np.float32)
+    kernel = EccSettings.GAUSSIAN_KERNEL
+    horizontal_source = np.pad(source, ((0, 0), (2, 2)), mode="reflect")
+    legacy_horizontal = sum(
+        weight * horizontal_source[:, offset : offset + source.shape[1]]
+        for offset, weight in enumerate(kernel)
+    )
+    vertical_source = np.pad(legacy_horizontal, ((2, 2), (0, 0)), mode="reflect")
+    legacy = np.asarray(
+        sum(
+            weight * vertical_source[offset : offset + source.shape[0]]
+            for offset, weight in enumerate(kernel)
+        ),
+        dtype=np.float32,
+    )
+
     expected = cv2.GaussianBlur(image, (5, 5), 0)
     actual = _gaussian_blur_5x5(image)
 
+    np.testing.assert_array_equal(actual, legacy)
     np.testing.assert_allclose(actual, expected, rtol=0, atol=2e-7)
+
+
+@pytest.mark.parametrize("maximum_short_side", [83, 1_000])
+def test_parallel_ecc_pair_resize_matches_sequential_output(
+    monkeypatch,
+    maximum_short_side: int,
+) -> None:
+    rng = np.random.default_rng(517)
+    template = rng.random((137, 211), dtype=np.float32)
+    input_image = rng.random((137, 211), dtype=np.float32)
+    expected_template, expected_input, expected_scale = engine._resize_ecc_pair(
+        template,
+        input_image,
+        maximum_short_side,
+    )
+    monkeypatch.setattr(
+        EccSettings,
+        "PARALLEL_RESIZE_MIN_SOURCE_PIXELS",
+        0,
+    )
+    monkeypatch.setattr(engine, "cpu_count", lambda: 2)
+
+    actual_template, actual_input, actual_scale = engine._resize_ecc_pair(
+        template,
+        input_image,
+        maximum_short_side,
+    )
+
+    assert actual_scale == expected_scale
+    np.testing.assert_array_equal(actual_template, expected_template)
+    np.testing.assert_array_equal(actual_input, expected_input)
+
+
+def test_ecc_pair_resize_falls_back_when_threads_are_unavailable(
+    monkeypatch,
+) -> None:
+    rng = np.random.default_rng(523)
+    template = rng.random((91, 127), dtype=np.float32)
+    input_image = rng.random((91, 127), dtype=np.float32)
+    monkeypatch.setattr(engine, "cpu_count", lambda: 1)
+    expected = engine._resize_ecc_pair(template, input_image, 61)
+
+    class UnavailableExecutor:
+        def __init__(self, **_kwargs) -> None:
+            raise RuntimeError("worker threads unavailable")
+
+    monkeypatch.setattr(
+        EccSettings,
+        "PARALLEL_RESIZE_MIN_SOURCE_PIXELS",
+        0,
+    )
+    monkeypatch.setattr(engine, "cpu_count", lambda: 2)
+    monkeypatch.setattr(engine, "ThreadPoolExecutor", UnavailableExecutor)
+
+    actual = engine._resize_ecc_pair(template, input_image, 61)
+
+    assert actual[2] == expected[2]
+    for actual_image, expected_image in zip(actual[:2], expected[:2]):
+        np.testing.assert_array_equal(actual_image, expected_image)
 
 
 def test_ecc_iteration_workspace_preserves_direct_array_math() -> None:
