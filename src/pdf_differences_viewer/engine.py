@@ -79,6 +79,7 @@ class EccSettings:
 
     GAUSSIAN_KERNEL = np.array((1, 4, 6, 4, 1), dtype=np.float32) / 16.0
     MAX_WORKING_SHORT_SIDE_PX = 768
+    PARALLEL_RESIZE_MIN_SOURCE_PIXELS = 1_000_000
     MIN_VALID_PIXELS = 9
     REFINEMENT_MIN_SOURCE_SHORT_SIDE_PX = 2048
     REFINEMENT_SHORT_SIDE_PX = 1280
@@ -872,18 +873,31 @@ def _gaussian_blur_5x5(image: np.ndarray) -> np.ndarray:
     source = np.asarray(image, dtype=np.float32)
     kernel = EccSettings.GAUSSIAN_KERNEL
     horizontal_source = np.pad(source, ((0, 0), (2, 2)), mode="reflect")
-    horizontal = sum(
-        weight * horizontal_source[:, offset : offset + source.shape[1]]
-        for offset, weight in enumerate(kernel)
-    )
+    horizontal = np.empty_like(source)
+    scratch = np.empty_like(source)
+    for offset, weight in enumerate(kernel):
+        np.multiply(
+            weight,
+            horizontal_source[:, offset : offset + source.shape[1]],
+            out=scratch,
+        )
+        if offset == 0:
+            np.copyto(horizontal, scratch)
+        else:
+            np.add(horizontal, scratch, out=horizontal)
     vertical_source = np.pad(horizontal, ((2, 2), (0, 0)), mode="reflect")
-    return np.asarray(
-        sum(
-            weight * vertical_source[offset : offset + source.shape[0]]
-            for offset, weight in enumerate(kernel)
-        ),
-        dtype=np.float32,
-    )
+    output = np.empty_like(source)
+    for offset, weight in enumerate(kernel):
+        np.multiply(
+            weight,
+            vertical_source[offset : offset + source.shape[0]],
+            out=scratch,
+        )
+        if offset == 0:
+            np.copyto(output, scratch)
+        else:
+            np.add(output, scratch, out=output)
+    return output
 
 
 def _central_gradients(image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1528,32 +1542,76 @@ def _find_transform_ecc_euclidean_core(
     return float(rho), matrix
 
 
+def _resize_ecc_image(
+    image: np.ndarray,
+    target_width: int,
+    target_height: int,
+    scale: float,
+) -> np.ndarray:
+    """Resize one ECC image using the pair's shared geometry."""
+    if scale == 1.0:
+        return image
+    return np.asarray(
+        Image.fromarray(image).resize(
+            (target_width, target_height),
+            resample=Image.Resampling.BOX,
+        ),
+        dtype=np.float32,
+    )
+
+
 def _resize_ecc_pair(
     template: np.ndarray,
     input_image: np.ndarray,
     maximum_short_side: int,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """Resize an ECC pair together and return its uniform coordinate scale."""
+    """Resize an ECC pair together, concurrently when the source is large."""
     short_side = min(template.shape)
     scale = min(1.0, maximum_short_side / short_side)
     if scale == 1.0:
         return template, input_image, scale
     target_height = max(1, round(template.shape[0] * scale))
     target_width = max(1, round(template.shape[1] * scale))
-    template_working = np.asarray(
-        Image.fromarray(template).resize(
-            (target_width, target_height),
-            resample=Image.Resampling.BOX,
-        ),
-        dtype=np.float32,
-    )
-    input_working = np.asarray(
-        Image.fromarray(input_image).resize(
-            (target_width, target_height),
-            resample=Image.Resampling.BOX,
-        ),
-        dtype=np.float32,
-    )
+
+    def resize(image: np.ndarray) -> np.ndarray:
+        return _resize_ecc_image(
+            image,
+            target_width,
+            target_height,
+            scale,
+        )
+
+    def sequential() -> tuple[np.ndarray, np.ndarray, float]:
+        return resize(template), resize(input_image), scale
+
+    if (
+        template.size < EccSettings.PARALLEL_RESIZE_MIN_SOURCE_PIXELS
+        or (cpu_count() or 1) < 2
+    ):
+        return sequential()
+
+    executor: ThreadPoolExecutor | None = None
+    try:
+        executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="pdf-ecc-resize",
+        )
+        template_future = executor.submit(resize, template)
+        input_future = executor.submit(resize, input_image)
+    except (OSError, RuntimeError):
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        return sequential()
+    try:
+        template_working = template_future.result()
+        input_working = input_future.result()
+    except (MemoryError, OSError, RuntimeError):
+        executor.shutdown(wait=True, cancel_futures=True)
+        executor = None
+        return sequential()
+    finally:
+        if executor is not None:
+            executor.shutdown()
     return template_working, input_working, scale
 
 
