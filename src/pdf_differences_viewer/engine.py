@@ -305,7 +305,12 @@ def _bgr_to_gray(bgr: np.ndarray) -> np.ndarray:
 
 
 def _resize_bgr(image: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
-    """Resize a BGR image with Pillow, preserving the requested exact size."""
+    """Resize a BGR image with Pillow, preserving the requested exact size.
+
+    Pillow labels three-channel arrays as RGB, but its resize filters operate
+    on every channel independently.  Keeping the channels in BGR order avoids
+    two full-image BGR/RGB reversal copies without changing any pixel values.
+    """
     if image.shape[:2] == (target_height, target_width):
         return image.copy()
     source_height, source_width = image.shape[:2]
@@ -314,9 +319,9 @@ def _resize_bgr(image: np.ndarray, target_width: int, target_height: int) -> np.
         if source_width * source_height > target_width * target_height
         else Image.Resampling.BICUBIC
     )
-    rgb = Image.fromarray(np.ascontiguousarray(image[:, :, ::-1]))
-    resized_rgb = rgb.resize((target_width, target_height), resample=resample)
-    return np.ascontiguousarray(np.asarray(resized_rgb)[:, :, ::-1])
+    bgr = Image.fromarray(np.ascontiguousarray(image))
+    resized_bgr = bgr.resize((target_width, target_height), resample=resample)
+    return np.asarray(resized_bgr)
 
 
 def _warp_bgr_affine(
