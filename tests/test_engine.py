@@ -4,6 +4,7 @@ import cv2
 import pymupdf as fitz
 import numpy as np
 import pytest
+from PIL import Image
 
 import pdf_differences_viewer.engine as engine
 from pdf_differences_viewer.colors import DifferenceColors
@@ -222,6 +223,30 @@ def test_pillow_resize_and_numpy_affine_warp_preserve_bgr_geometry() -> None:
     warped = _warp_bgr_affine(source, matrix, 5, 5)
     np.testing.assert_array_equal(warped[2, 2], (0, 0, 0))
     assert np.count_nonzero(np.all(warped == 0, axis=2)) == 1
+
+
+@pytest.mark.parametrize("target_size", [(9, 7), (41, 29)])
+def test_pillow_resize_without_channel_reversals_matches_legacy_output(
+    target_size: tuple[int, int],
+) -> None:
+    rng = np.random.default_rng(9104)
+    source = rng.integers(0, 256, size=(17, 23, 3), dtype=np.uint8)
+    target_width, target_height = target_size
+    resample = (
+        Image.Resampling.BOX
+        if source.shape[1] * source.shape[0] > target_width * target_height
+        else Image.Resampling.BICUBIC
+    )
+    legacy_rgb = Image.fromarray(np.ascontiguousarray(source[:, :, ::-1]))
+    legacy = np.ascontiguousarray(
+        np.asarray(legacy_rgb.resize(target_size, resample=resample))[:, :, ::-1]
+    )
+
+    actual = _resize_bgr(source, target_width, target_height)
+
+    np.testing.assert_array_equal(actual, legacy)
+    assert actual.dtype == np.uint8
+    assert actual.flags.c_contiguous
 
 
 def test_numpy_binary_translation_matches_opencv_nearest_inverse_warp() -> None:
