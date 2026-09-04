@@ -151,6 +151,16 @@ class AlignmentMetadata:
 
 
 @dataclass
+class _PreparedAlignment:
+    """Aligned page plus grayscale buffers that remain valid for masking."""
+
+    old_bgr: np.ndarray
+    metadata: AlignmentMetadata
+    old_gray: np.ndarray | None
+    new_gray: np.ndarray
+
+
+@dataclass
 class RenderedPage:
     """A rendered page, retained separately when callers want its dimensions."""
 
@@ -537,9 +547,19 @@ def _warp_bgr_affine_numpy(
     return output
 
 
-def _threshold_gray_channel(gray: np.ndarray, ink_threshold: int) -> np.ndarray:
-    """Return a zero/255 mask while writing the comparison directly to uint8."""
-    result = np.empty(gray.shape, dtype=np.uint8)
+def _threshold_gray_channel(
+    gray: np.ndarray,
+    ink_threshold: int,
+    *,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return a zero/255 mask, optionally reusing a writable uint8 buffer."""
+    if out is None:
+        result = np.empty(gray.shape, dtype=np.uint8)
+    else:
+        if out.shape != gray.shape or out.dtype != np.uint8:
+            raise ValueError("threshold output must match the grayscale shape and use uint8")
+        result = out
     np.less(gray, ink_threshold, out=result)
     np.multiply(result, 255, out=result)
     return result
@@ -1975,12 +1995,12 @@ def _should_fast_reject_ecc(old_gray: np.ndarray, new_gray: np.ndarray, ink_thre
     return coarse_score is not None and coarse_score < AlignmentSettings.FAST_REJECT_MAX_ECC_SCORE
 
 
-def _align_old_to_new(
+def _prepare_old_alignment(
     old_bgr: np.ndarray,
     new_bgr: np.ndarray,
     *,
     ink_threshold: int = DEFAULT_INK_THRESHOLD,
-) -> tuple[np.ndarray, AlignmentMetadata]:
+) -> _PreparedAlignment:
     target_h, target_w = new_bgr.shape[:2]
     old_h, old_w = old_bgr.shape[:2]
     resized = _resize_bgr(old_bgr, target_w, target_h)
@@ -1989,13 +2009,28 @@ def _align_old_to_new(
     new_gray = _bgr_to_gray(new_bgr)
     # ECC is deterministic and particularly effective for scanned/printed pages.
     if old_gray.std() < 1.0 or new_gray.std() < 1.0:
-        return resized, AlignmentMetadata(**{**base.__dict__, "message": "blank or near-uniform page; resize only"})
+        return _PreparedAlignment(
+            resized,
+            AlignmentMetadata(
+                **{
+                    **base.__dict__,
+                    "message": "blank or near-uniform page; resize only",
+                }
+            ),
+            old_gray,
+            new_gray,
+        )
     if _should_fast_reject_ecc(old_gray, new_gray, ink_threshold):
-        return resized, AlignmentMetadata(
-            **{
-                **base.__dict__,
-                "message": "fast-reject: coarse phase, ink overlap, and ECC indicate unrelated pages; resize only",
-            }
+        return _PreparedAlignment(
+            resized,
+            AlignmentMetadata(
+                **{
+                    **base.__dict__,
+                    "message": "fast-reject: coarse phase, ink overlap, and ECC indicate unrelated pages; resize only",
+                }
+            ),
+            old_gray,
+            new_gray,
         )
     # ECC only converges within a fairly small basin.  Phase correlation gives
     # a cheap translation estimate first, which makes ordinary scanner/page
@@ -2019,7 +2054,17 @@ def _align_old_to_new(
             1e-6,
         )
         if not np.isfinite(score) or score < 0.50:
-            return resized, AlignmentMetadata(**{**base.__dict__, "message": f"ECC score {score:.3f} was too low; resize only"})
+            return _PreparedAlignment(
+                resized,
+                AlignmentMetadata(
+                    **{
+                        **base.__dict__,
+                        "message": f"ECC score {score:.3f} was too low; resize only",
+                    }
+                ),
+                old_gray,
+                new_gray,
+            )
         aligned = _warp_bgr_affine(
             resized,
             matrix,
@@ -2028,7 +2073,20 @@ def _align_old_to_new(
             ink_threshold=ink_threshold,
         )
         moved = not np.allclose(matrix, np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32), atol=0.15)
-        return aligned, AlignmentMetadata("ecc-euclidean", True, float(score), matrix, (old_w, old_h), (target_w, target_h), moved)
+        return _PreparedAlignment(
+            aligned,
+            AlignmentMetadata(
+                "ecc-euclidean",
+                True,
+                float(score),
+                matrix,
+                (old_w, old_h),
+                (target_w, target_h),
+                moved,
+            ),
+            None,
+            new_gray,
+        )
     except (EccConvergenceError, MemoryError, np.linalg.LinAlgError) as exc:
         if phase_is_plausible:
             aligned = _warp_bgr_affine(
@@ -2039,17 +2097,47 @@ def _align_old_to_new(
                 ink_threshold=ink_threshold,
             )
             moved = not np.allclose(matrix, np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32), atol=0.15)
-            return aligned, AlignmentMetadata(
-                "phase-correlation",
-                True,
-                float(phase_score),
-                matrix,
-                (old_w, old_h),
-                (target_w, target_h),
-                moved,
-                "ECC refinement unavailable; using phase-correlation alignment",
+            return _PreparedAlignment(
+                aligned,
+                AlignmentMetadata(
+                    "phase-correlation",
+                    True,
+                    float(phase_score),
+                    matrix,
+                    (old_w, old_h),
+                    (target_w, target_h),
+                    moved,
+                    "ECC refinement unavailable; using phase-correlation alignment",
+                ),
+                None,
+                new_gray,
             )
-        return resized, AlignmentMetadata(**{**base.__dict__, "message": f"ECC alignment unavailable: {str(exc).splitlines()[0]}"})
+        return _PreparedAlignment(
+            resized,
+            AlignmentMetadata(
+                **{
+                    **base.__dict__,
+                    "message": f"ECC alignment unavailable: {str(exc).splitlines()[0]}",
+                }
+            ),
+            old_gray,
+            new_gray,
+        )
+
+
+def _align_old_to_new(
+    old_bgr: np.ndarray,
+    new_bgr: np.ndarray,
+    *,
+    ink_threshold: int = DEFAULT_INK_THRESHOLD,
+) -> tuple[np.ndarray, AlignmentMetadata]:
+    """Align the old page while preserving the existing two-value interface."""
+    prepared = _prepare_old_alignment(
+        old_bgr,
+        new_bgr,
+        ink_threshold=ink_threshold,
+    )
+    return prepared.old_bgr, prepared.metadata
 
 
 def _distance_transform_l2_mask3(source: np.ndarray) -> np.ndarray:
@@ -2601,13 +2689,26 @@ def compare_page_images(
     _progress(progress, "normalizing images", 0.05)
     old_bgr, new_bgr = _as_bgr(old_image), _as_bgr(new_image)
     _progress(progress, "aligning pages", 0.20)
-    old_aligned, alignment = _align_old_to_new(
+    prepared = _prepare_old_alignment(
         old_bgr,
         new_bgr,
         ink_threshold=ink_threshold,
     )
+    old_aligned, alignment = prepared.old_bgr, prepared.metadata
     _progress(progress, "finding ink", 0.55)
-    old_ink, new_ink = _ink_mask(old_aligned, ink_threshold), _ink_mask(new_bgr, ink_threshold)
+    if prepared.old_gray is None:
+        old_ink = _ink_mask(old_aligned, ink_threshold)
+    else:
+        old_ink = _threshold_gray_channel(
+            prepared.old_gray,
+            ink_threshold,
+            out=prepared.old_gray,
+        )
+    new_ink = _threshold_gray_channel(
+        prepared.new_gray,
+        ink_threshold,
+        out=prepared.new_gray,
+    )
     added_mask = _difference_mask(new_ink, old_ink, tolerance_px)
     removed_mask = _difference_mask(old_ink, new_ink, tolerance_px)
     _progress(progress, "extracting regions", 0.75)

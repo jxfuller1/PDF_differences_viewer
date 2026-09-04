@@ -31,6 +31,7 @@ from pdf_differences_viewer.engine import (
     _resize_bgr,
     _rgb_to_bgr,
     _should_fast_reject_ecc,
+    _threshold_gray_channel,
     _warp_bgr_affine,
     _warp_bgr_affine_numpy,
     _warp_binary_translation_nearest,
@@ -204,6 +205,65 @@ def test_ink_mask_fractional_threshold_preserves_previous_semantics() -> None:
             _ink_mask(image, threshold),
             _ink_mask_oracle(image, threshold),
         )
+
+
+@pytest.mark.parametrize("threshold", [0, 0.5, 245, 245.5, 255])
+def test_threshold_gray_channel_can_reuse_its_input_buffer(threshold: float) -> None:
+    gray = np.array([[0, 29, 30, 244, 245, 255]], dtype=np.uint8)
+    expected = np.where(gray < threshold, 255, 0).astype(np.uint8)
+
+    actual = _threshold_gray_channel(gray, threshold, out=gray)
+
+    assert actual is gray
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_compare_reuses_cached_grayscale_for_resize_only_ink_masks(monkeypatch) -> None:
+    old = _blank(80, 96)
+    new = _blank(80, 96)
+    old[12:36, 14:42] = (10, 70, 220)
+    new[40:65, 48:78] = (200, 40, 5)
+    expected_old = _ink_mask(old, 245)
+    expected_new = _ink_mask(new, 245)
+    monkeypatch.setattr(engine, "_should_fast_reject_ecc", lambda *_args: True)
+
+    def unexpected_ink_mask(*_args, **_kwargs):
+        raise AssertionError("resize-only alignment should reuse both grayscale buffers")
+
+    monkeypatch.setattr(engine, "_ink_mask", unexpected_ink_mask)
+    result = compare_page_images(old, new, tolerance_px=0)
+
+    np.testing.assert_array_equal(result.added_mask, _difference_mask(expected_new, expected_old, 0))
+    np.testing.assert_array_equal(result.removed_mask, _difference_mask(expected_old, expected_new, 0))
+
+
+def test_compare_recomputes_only_warped_old_ink_mask(monkeypatch) -> None:
+    old = _blank(80, 96)
+    new = old.copy()
+    old[12:36, 14:42] = (10, 70, 220)
+    new[12:36, 14:42] = (10, 70, 220)
+    expected = _ink_mask(old, 245)
+    original_ink_mask = engine._ink_mask
+    ink_mask_calls: list[np.ndarray] = []
+    monkeypatch.setattr(engine, "_should_fast_reject_ecc", lambda *_args: False)
+    monkeypatch.setattr(engine, "_phase_correlate", lambda *_args: ((0.0, 0.0), 1.0))
+    monkeypatch.setattr(
+        engine,
+        "_find_transform_ecc_euclidean",
+        lambda *_args: (0.95, np.eye(2, 3, dtype=np.float32)),
+    )
+    monkeypatch.setattr(engine, "_warp_bgr_affine", lambda image, *_args, **_kwargs: image.copy())
+
+    def tracked_ink_mask(image, threshold):
+        ink_mask_calls.append(image)
+        return original_ink_mask(image, threshold)
+
+    monkeypatch.setattr(engine, "_ink_mask", tracked_ink_mask)
+    result = compare_page_images(old, new, tolerance_px=0)
+
+    assert len(ink_mask_calls) == 1
+    np.testing.assert_array_equal(result.added_mask, np.zeros_like(expected))
+    np.testing.assert_array_equal(result.removed_mask, np.zeros_like(expected))
 
 
 def test_pillow_resize_and_numpy_affine_warp_preserve_bgr_geometry() -> None:
