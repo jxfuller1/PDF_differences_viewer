@@ -1404,6 +1404,87 @@ def test_regions_without_opencv_components_match_randomized_legacy_results() -> 
                 assert actual == sorted(expected, key=_region_order)
 
 
+def test_parallel_region_pair_matches_sequential_results(monkeypatch) -> None:
+    added = np.zeros((91, 127), dtype=np.uint8)
+    removed = np.zeros_like(added)
+    added[4:12, 8:21] = 255
+    added[50:61, 79:94] = 255
+    removed[18:31, 42:53] = 255
+    removed[70:78, 105:119] = 255
+    expected = (
+        _regions(added, "added", 4, 20),
+        _regions(removed, "removed", 4, 20),
+    )
+    monkeypatch.setattr(engine.RegionExtractionSettings, "PARALLEL_MIN_PIXELS", 0)
+    monkeypatch.setattr(engine, "cpu_count", lambda: 2)
+
+    actual = engine._extract_region_pair(added, removed, 4, 20)
+
+    assert actual == expected
+
+
+def test_region_pair_falls_back_when_thread_pool_is_unavailable(monkeypatch) -> None:
+    added = np.zeros((31, 43), dtype=np.uint8)
+    removed = np.zeros_like(added)
+    added[3:9, 5:14] = 255
+    removed[17:24, 27:38] = 255
+    expected = (
+        _regions(added, "added", 1, 3),
+        _regions(removed, "removed", 1, 3),
+    )
+    monkeypatch.setattr(engine.RegionExtractionSettings, "PARALLEL_MIN_PIXELS", 0)
+    monkeypatch.setattr(engine, "cpu_count", lambda: 2)
+
+    class UnavailableExecutor:
+        def __init__(self, *args, **kwargs):
+            raise OSError("thread creation unavailable")
+
+    monkeypatch.setattr(engine, "ThreadPoolExecutor", UnavailableExecutor)
+
+    assert engine._extract_region_pair(added, removed, 1, 3) == expected
+
+
+def test_region_pair_retries_sequentially_when_worker_fails(monkeypatch) -> None:
+    added = np.zeros((37, 47), dtype=np.uint8)
+    removed = np.zeros_like(added)
+    added[4:13, 7:18] = 255
+    removed[21:30, 29:41] = 255
+    expected = (
+        _regions(added, "added", 1, 4),
+        _regions(removed, "removed", 1, 4),
+    )
+    monkeypatch.setattr(engine.RegionExtractionSettings, "PARALLEL_MIN_PIXELS", 0)
+    monkeypatch.setattr(engine, "cpu_count", lambda: 2)
+
+    class FailedFuture:
+        def result(self):
+            raise RuntimeError("worker failed")
+
+    class CompletedFuture:
+        def __init__(self, result):
+            self._result = result
+
+        def result(self):
+            return self._result
+
+    class FailingExecutor:
+        def __init__(self, *args, **kwargs):
+            self._submissions = 0
+
+        def submit(self, function, *args):
+            self._submissions += 1
+            if self._submissions == 1:
+                return FailedFuture()
+            return CompletedFuture(function(*args))
+
+        def shutdown(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(engine, "ThreadPoolExecutor", FailingExecutor)
+
+    assert engine._extract_region_pair(added, removed, 1, 4) == expected
+
+
 def test_regions_edge_shapes_and_offsets_match_legacy_oracle() -> None:
     """Exercise small/degenerate masks and positive (not just 255) pixels."""
     masks = [
