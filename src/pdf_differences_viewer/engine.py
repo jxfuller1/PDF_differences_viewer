@@ -123,6 +123,7 @@ class MaskDilationSettings:
     """Tuning values for grouped sparse change masks."""
 
     QT_MAX_FOREGROUND_FRACTION = 0.005
+    QT_MAX_RUN_FRACTION = 0.005
 
 
 @dataclass(frozen=True)
@@ -1964,21 +1965,39 @@ def _difference_mask(source_ink: np.ndarray, reference_ink: np.ndarray, toleranc
     return result
 
 
-def _dilate_binary_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
+def _dilate_binary_mask(
+    mask: np.ndarray,
+    kernel_size: int,
+    *,
+    foreground_runs: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+) -> np.ndarray:
     """Dilate a zero/255 mask with OpenCV's rectangular-kernel semantics.
 
     Sparse masks use Qt's native raster painter to fill the kernel rectangle at
-    each ink pixel. Dense masks use a summed-area table instead. Both preserve
-    OpenCV's default center anchor for even kernels: a 20-pixel kernel examines
-    offsets -10..9 from each output pixel, so a source pixel expands 9 pixels
-    up/left and 10 pixels down/right. Out-of-bounds pixels remain background.
+    each ink pixel. Drawing-like masks reuse their horizontal foreground runs
+    and paint one rectangle per merged run; dense masks use a summed-area table
+    instead. All paths preserve OpenCV's default center anchor for even kernels:
+    a 20-pixel kernel examines offsets -10..9 from each output pixel, so a
+    source pixel expands 9 pixels up/left and 10 pixels down/right.
+    Out-of-bounds pixels remain background.
     """
     if kernel_size == 1:
         return mask.copy()
-    foreground_count = int(np.count_nonzero(mask))
+    if foreground_runs is None:
+        foreground_count = int(np.count_nonzero(mask))
+    else:
+        foreground_count = int(np.sum(foreground_runs[2] - foreground_runs[1] + 1))
     if foreground_count <= mask.size * MaskDilationSettings.QT_MAX_FOREGROUND_FRACTION:
         try:
             return _dilate_sparse_binary_mask_qt(mask, kernel_size)
+        except (RuntimeError, TypeError, ValueError):
+            pass
+    if (
+        foreground_runs is not None
+        and foreground_runs[0].size <= mask.size * MaskDilationSettings.QT_MAX_RUN_FRACTION
+    ):
+        try:
+            return _dilate_binary_runs_qt(mask.shape, kernel_size, *foreground_runs)
         except (RuntimeError, TypeError, ValueError):
             pass
     return _dilate_binary_mask_integral(mask, kernel_size)
@@ -1996,6 +2015,61 @@ def _dilate_sparse_binary_mask_qt(mask: np.ndarray, kernel_size: int) -> np.ndar
         QRect(int(x - leading_extent), int(y - leading_extent), kernel_size, kernel_size)
         for y, x in zip(ys, xs)
     ]
+    painter = QPainter(output_image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+    painter.setPen(QPen(Qt.PenStyle.NoPen))
+    painter.setBrush(QBrush(QColor(255, 255, 255)))
+    painter.drawRects(rectangles)
+    painter.end()
+
+    bits = output_image.bits()
+    bits.setsize(output_image.sizeInBytes())
+    return np.frombuffer(bits, dtype=np.uint8).reshape(height, output_image.bytesPerLine())[:, :width].copy()
+
+
+def _dilate_binary_runs_qt(
+    shape: tuple[int, int],
+    kernel_size: int,
+    rows: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+) -> np.ndarray:
+    """Dilate horizontal foreground runs with Qt raster rectangles.
+
+    Every source run expands into one rectangle instead of one rectangle per
+    foreground pixel. Overlapping expanded runs on the same row are merged
+    before painting, which keeps drawing-like masks on Qt's fast raster path.
+    """
+    height, width = shape
+    if not rows.size:
+        return np.zeros(shape, dtype=np.uint8)
+
+    anchor = kernel_size // 2
+    leading_extent = kernel_size - anchor - 1
+    expanded_starts = np.maximum(starts - leading_extent, 0)
+    expanded_ends = np.minimum(ends + anchor, width - 1)
+
+    group_starts = np.empty(rows.size, dtype=bool)
+    group_starts[0] = True
+    group_starts[1:] = (rows[1:] != rows[:-1]) | (
+        expanded_starts[1:] > expanded_ends[:-1] + 1
+    )
+    group_indices = np.flatnonzero(group_starts)
+    merged_rows = rows[group_indices]
+    merged_starts = expanded_starts[group_indices]
+    merged_ends = np.maximum.reduceat(expanded_ends, group_indices)
+    rectangles = [
+        QRect(
+            int(start),
+            int(row - leading_extent),
+            int(end - start + 1),
+            kernel_size,
+        )
+        for row, start, end in zip(merged_rows, merged_starts, merged_ends)
+    ]
+
+    output_image = QImage(width, height, QImage.Format.Format_Grayscale8)
+    output_image.fill(0)
     painter = QPainter(output_image)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
     painter.setPen(QPen(Qt.PenStyle.NoPen))
@@ -2157,16 +2231,23 @@ def _regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distance: int
     top, bottom = int(occupied_rows[0]), int(occupied_rows[-1]) + 1
     left, right = int(occupied_columns[0]), int(occupied_columns[-1]) + 1
     raw_foreground = np.ascontiguousarray(raw_foreground[top:bottom, left:right])
+    raw_rows, raw_starts, raw_ends = _foreground_run_table(raw_foreground)
 
     if merge_distance:
         grouped = np.ascontiguousarray(
-            _dilate_binary_mask(raw_foreground, merge_distance) > 0
+            _dilate_binary_mask(
+                raw_foreground,
+                merge_distance,
+                foreground_runs=(raw_rows, raw_starts, raw_ends),
+            )
+            > 0
         )
+        grouped_rows, grouped_starts, grouped_ends = _foreground_run_table(grouped)
     else:
         grouped = raw_foreground
+        grouped_rows, grouped_starts, grouped_ends = raw_rows, raw_starts, raw_ends
 
     height, width = grouped.shape
-    grouped_rows, grouped_starts, grouped_ends = _foreground_run_table(grouped)
     count, grouped_labels = _connected_run_labels_8(
         grouped_rows,
         grouped_starts,
@@ -2175,7 +2256,6 @@ def _regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distance: int
     )
 
     if merge_distance:
-        raw_rows, raw_starts, raw_ends = _foreground_run_table(raw_foreground)
         # A raw run is contained in exactly one dilated run.  Flattening each
         # row into a disjoint numeric range lets one vectorized search map all
         # raw runs back to their grouped component labels.
