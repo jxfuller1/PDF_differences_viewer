@@ -89,6 +89,47 @@ def test_bgr_to_gray_matches_legacy_integer_arithmetic() -> None:
     np.testing.assert_array_equal(_bgr_to_gray(non_integer), legacy(non_integer))
 
 
+def test_bgr_to_gray_monochrome_fast_path_is_exact_and_contiguous(monkeypatch) -> None:
+    rng = np.random.default_rng(342)
+    gray = rng.integers(0, 256, size=(137, 251), dtype=np.uint8)
+    bgr = np.repeat(gray[:, :, np.newaxis], 3, axis=2)
+    bgra = np.concatenate(
+        (bgr, rng.integers(0, 256, size=(*gray.shape, 1), dtype=np.uint8)),
+        axis=2,
+    )
+
+    def unexpected_weighted_conversion(*args, **kwargs):
+        raise AssertionError("monochrome input should not use weighted luma")
+
+    monkeypatch.setattr(np, "einsum", unexpected_weighted_conversion)
+    for image in (bgr, bgra, bgra[::2, ::3]):
+        actual = _bgr_to_gray(image)
+        np.testing.assert_array_equal(actual, image[:, :, 0])
+        assert actual.dtype == np.uint8
+        assert actual.flags.c_contiguous
+
+
+def test_bgr_to_gray_off_sample_color_uses_weighted_conversion() -> None:
+    image = np.repeat(
+        np.arange(65 * 65, dtype=np.uint16).reshape(65, 65)[:, :, np.newaxis] % 256,
+        3,
+        axis=2,
+    ).astype(np.uint8)
+    image[1, 1] = (5, 73, 241)
+
+    expected = (
+        (
+            image[:, :, 2].astype(np.uint32) * InkMaskSettings.RED_WEIGHT
+            + image[:, :, 1].astype(np.uint32) * InkMaskSettings.GREEN_WEIGHT
+            + image[:, :, 0].astype(np.uint32) * InkMaskSettings.BLUE_WEIGHT
+            + InkMaskSettings.LUMA_ROUNDING
+        )
+        // InkMaskSettings.LUMA_SCALE
+    ).astype(np.uint8)
+
+    np.testing.assert_array_equal(_bgr_to_gray(image), expected)
+
+
 def _ink_mask_oracle(image: np.ndarray, threshold: int) -> np.ndarray:
     return np.where(_bgr_to_gray(image) < threshold, 255, 0).astype(np.uint8)
 
