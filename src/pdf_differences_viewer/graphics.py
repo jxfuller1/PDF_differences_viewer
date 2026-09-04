@@ -8,6 +8,7 @@ zooming and reviewing inexpensive even for large rendered pages.
 from __future__ import annotations
 
 import math
+from sys import byteorder
 from typing import Any
 
 import numpy as np
@@ -49,12 +50,30 @@ def bgra_to_pixmap(array: np.ndarray) -> QPixmap:
     image = np.asarray(array)
     if image.ndim != 3 or image.shape[2] not in (3, 4) or image.shape[0] == 0 or image.shape[1] == 0:
         raise ValueError("image must be a non-empty HxWx3 or HxWx4 array")
-    # Qt's byte-oriented QImage formats require uint8; make a private,
-    # contiguous buffer so a temporary numpy view can never be referenced.
+    # Qt's byte-oriented QImage formats require uint8 and contiguous rows.
+    # The QImage.copy() below gives Qt private ownership before this returns.
     image = np.ascontiguousarray(image.astype(np.uint8, copy=False))
-    rgba = np.ascontiguousarray(image[:, :, [2, 1, 0, 3]] if image.shape[2] == 4 else image[:, :, [2, 1, 0]])
-    fmt = QImage.Format.Format_RGBA8888 if image.shape[2] == 4 else QImage.Format.Format_RGB888
-    qimage = QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.strides[0], fmt).copy()
+    if image.shape[2] == 4 and byteorder == "little":
+        # ARGB32 is stored as BGRA bytes on little-endian systems, matching
+        # the engine output directly. Avoid advanced-indexing and copying a
+        # complete high-DPI page merely to reorder its four channels.
+        pixels = image
+        fmt = QImage.Format.Format_ARGB32
+    else:
+        order = [2, 1, 0, 3] if image.shape[2] == 4 else [2, 1, 0]
+        pixels = np.ascontiguousarray(image[:, :, order])
+        fmt = (
+            QImage.Format.Format_RGBA8888
+            if image.shape[2] == 4
+            else QImage.Format.Format_RGB888
+        )
+    qimage = QImage(
+        pixels.data,
+        pixels.shape[1],
+        pixels.shape[0],
+        pixels.strides[0],
+        fmt,
+    ).copy()
     return QPixmap.fromImage(qimage)
 
 
