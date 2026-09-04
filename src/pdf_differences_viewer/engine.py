@@ -127,6 +127,12 @@ class MaskDilationSettings:
     QT_MAX_RUN_FRACTION = 0.005
 
 
+class RegionExtractionSettings:
+    """Dispatch limits for extracting independent change-region lists."""
+
+    PARALLEL_MIN_PIXELS = 1_000_000
+
+
 @dataclass(frozen=True)
 class DifferenceRegion:
     """A connected changed area in image coordinates."""
@@ -2661,6 +2667,61 @@ def _regions(mask: np.ndarray, kind: str, minimum_area: int, merge_distance: int
     )
 
 
+def _extract_region_pair(
+    added_mask: np.ndarray,
+    removed_mask: np.ndarray,
+    minimum_area: int,
+    merge_distance: int,
+) -> tuple[list[DifferenceRegion], list[DifferenceRegion]]:
+    """Extract independent added/removed regions concurrently on large pages."""
+
+    def sequential() -> tuple[list[DifferenceRegion], list[DifferenceRegion]]:
+        return (
+            _regions(added_mask, "added", minimum_area, merge_distance),
+            _regions(removed_mask, "removed", minimum_area, merge_distance),
+        )
+
+    if (
+        added_mask.size < RegionExtractionSettings.PARALLEL_MIN_PIXELS
+        or (cpu_count() or 1) < 2
+    ):
+        return sequential()
+
+    executor: ThreadPoolExecutor | None = None
+    try:
+        executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="pdf-regions",
+        )
+        added_future = executor.submit(
+            _regions,
+            added_mask,
+            "added",
+            minimum_area,
+            merge_distance,
+        )
+        removed_future = executor.submit(
+            _regions,
+            removed_mask,
+            "removed",
+            minimum_area,
+            merge_distance,
+        )
+    except (OSError, RuntimeError):
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        return sequential()
+    try:
+        return added_future.result(), removed_future.result()
+    except (MemoryError, OSError, RuntimeError):
+        executor.shutdown(wait=True, cancel_futures=True)
+        executor = None
+        return sequential()
+    finally:
+        if executor is not None:
+            executor.shutdown()
+
+
 def _layer(mask: np.ndarray, bgr_color: tuple[int, int, int], alpha: int) -> np.ndarray:
     layer = np.zeros((*mask.shape, 4), dtype=np.uint8)
     layer[mask > 0, :3] = bgr_color
@@ -2712,8 +2773,12 @@ def compare_page_images(
     added_mask = _difference_mask(new_ink, old_ink, tolerance_px)
     removed_mask = _difference_mask(old_ink, new_ink, tolerance_px)
     _progress(progress, "extracting regions", 0.75)
-    added_regions = _regions(added_mask, "added", minimum_region_area, region_merge_distance)
-    removed_regions = _regions(removed_mask, "removed", minimum_region_area, region_merge_distance)
+    added_regions, removed_regions = _extract_region_pair(
+        added_mask,
+        removed_mask,
+        minimum_region_area,
+        region_merge_distance,
+    )
     # Layers are BGRA here, matching OpenCV/QImage byte order on Windows.
     # Added ink is bright blue; removed ink is bright red.
     added_layer = _layer(added_mask, DifferenceColors.ADDITION_BGR, overlay_alpha)
