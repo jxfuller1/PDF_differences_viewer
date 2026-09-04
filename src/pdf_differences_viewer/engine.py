@@ -988,6 +988,117 @@ def _prepare_ecc_channel_images(
     )
 
 
+class _EccChannelWarpWorkspace:
+    """Reuse the large output, coordinate, and mask arrays for ECC warps."""
+
+    def __init__(
+        self,
+        source_shape: tuple[int, int],
+        destination_x: np.ndarray,
+        destination_y: np.ndarray,
+        channel_count: int,
+    ) -> None:
+        self._source_height, self._source_width = source_shape
+        self._destination_x = destination_x[0]
+        self._destination_y = destination_y[:, 0]
+        destination_height = destination_y.shape[0]
+        destination_width = destination_x.shape[1]
+        shape = (destination_height, destination_width)
+        self.warped = np.empty(
+            (channel_count, destination_height, destination_width),
+            dtype=np.float32,
+        )
+        self.source_x = np.empty(shape, dtype=np.float32)
+        self.source_y = np.empty(shape, dtype=np.float32)
+        self._x_term = np.empty(destination_width, dtype=np.float32)
+        self._y_term = np.empty(destination_height, dtype=np.float32)
+        self.valid = np.empty(shape, dtype=bool)
+        self._mask_scratch = np.empty(shape, dtype=bool)
+        self.edge = np.empty(shape, dtype=bool)
+
+    def map_coordinates(
+        self,
+        matrix: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Build the source map and validity masks without temporary images."""
+        np.multiply(matrix[0, 0], self._destination_x, out=self._x_term)
+        np.multiply(matrix[0, 1], self._destination_y, out=self._y_term)
+        np.add(
+            self._x_term[np.newaxis, :],
+            self._y_term[:, np.newaxis],
+            out=self.source_x,
+        )
+        np.add(self.source_x, matrix[0, 2], out=self.source_x)
+
+        np.multiply(matrix[1, 0], self._destination_x, out=self._x_term)
+        np.multiply(matrix[1, 1], self._destination_y, out=self._y_term)
+        np.add(
+            self._x_term[np.newaxis, :],
+            self._y_term[:, np.newaxis],
+            out=self.source_y,
+        )
+        np.add(self.source_y, matrix[1, 2], out=self.source_y)
+
+        # This is exactly equivalent to checking whether np.rint(coordinate)
+        # lies in [0, size). At the positive half-pixel tie, round-to-even
+        # includes the coordinate only when the source dimension is odd.
+        np.greater_equal(self.source_x, -0.5, out=self.valid)
+        upper_x = self._source_width - 0.5
+        if self._source_width % 2:
+            np.less_equal(self.source_x, upper_x, out=self._mask_scratch)
+        else:
+            np.less(self.source_x, upper_x, out=self._mask_scratch)
+        np.logical_and(self.valid, self._mask_scratch, out=self.valid)
+        np.greater_equal(self.source_y, -0.5, out=self._mask_scratch)
+        np.logical_and(self.valid, self._mask_scratch, out=self.valid)
+        upper_y = self._source_height - 0.5
+        if self._source_height % 2:
+            np.less_equal(self.source_y, upper_y, out=self._mask_scratch)
+        else:
+            np.less(self.source_y, upper_y, out=self._mask_scratch)
+        np.logical_and(self.valid, self._mask_scratch, out=self.valid)
+
+        np.less(self.source_x, 0, out=self.edge)
+        np.greater(
+            self.source_x,
+            self._source_width - 1,
+            out=self._mask_scratch,
+        )
+        np.logical_or(self.edge, self._mask_scratch, out=self.edge)
+        np.less(self.source_y, 0, out=self._mask_scratch)
+        np.logical_or(self.edge, self._mask_scratch, out=self.edge)
+        np.greater(
+            self.source_y,
+            self._source_height - 1,
+            out=self._mask_scratch,
+        )
+        np.logical_or(self.edge, self._mask_scratch, out=self.edge)
+        np.logical_and(self.edge, self.valid, out=self.edge)
+        return self.source_x, self.source_y, self.valid, self.edge
+
+
+def _transform_ecc_channel_reused(
+    source: Image.Image,
+    destination: Image.Image,
+    affine: tuple[float, ...],
+) -> None:
+    """Transform into an existing mode-F image when Pillow exposes its core."""
+    transform = getattr(destination.im, "transform", None)
+    if not callable(transform):
+        # Pillow 10 used this name for the otherwise identical core operation.
+        transform = getattr(destination.im, "transform2", None)
+    if not callable(transform):
+        raise AttributeError("Pillow does not expose a reusable transform core")
+    transform(
+        (0, 0, destination.width, destination.height),
+        source.im,
+        Image.Transform.AFFINE,
+        affine,
+        Image.Resampling.BILINEAR,
+        1,
+    )
+
+
 class _ArrowSchema(ctypes.Structure):
     """ABI-stable Arrow C Data Interface schema header."""
 
@@ -1118,26 +1229,38 @@ def _warp_ecc_channels_pillow(
     destination_y: np.ndarray,
     source_images: tuple[Image.Image, ...],
     executor: ThreadPoolExecutor | None,
+    *,
+    workspace: _EccChannelWarpWorkspace | None = None,
+    output_images: tuple[Image.Image, ...] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Warp ECC channels in Pillow's compiled sampler, repairing its borders."""
     source_height, source_width = source_shape
     destination_height = destination_y.shape[0]
     destination_width = destination_x.shape[1]
     affine = _ecc_pillow_affine(matrix)
-    warped = np.empty(
-        (len(source_images), destination_height, destination_width),
-        dtype=np.float32,
-    )
+    if workspace is None:
+        warped = np.empty(
+            (len(source_images), destination_height, destination_width),
+            dtype=np.float32,
+        )
+    else:
+        warped = workspace.warped
+    if output_images is not None and len(output_images) != len(source_images):
+        raise ValueError("reusable ECC output count does not match source channels")
 
     def transform_channel(item: tuple[int, Image.Image]) -> None:
         index, image = item
-        transformed = image.transform(
-            (destination_width, destination_height),
-            Image.Transform.AFFINE,
-            affine,
-            resample=Image.Resampling.BILINEAR,
-            fillcolor=0.0,
-        )
+        if output_images is None:
+            transformed = image.transform(
+                (destination_width, destination_height),
+                Image.Transform.AFFINE,
+                affine,
+                resample=Image.Resampling.BILINEAR,
+                fillcolor=0.0,
+            )
+        else:
+            transformed = output_images[index]
+            _transform_ecc_channel_reused(image, transformed, affine)
         # Every task owns one disjoint channel plane. Copying here keeps the
         # Pillow-to-NumPy conversion parallel and avoids a later stack copy.
         _copy_pillow_float_image(transformed, warped[index])
@@ -1155,36 +1278,39 @@ def _warp_ecc_channels_pillow(
             for item in enumerate(source_images)
         )
 
-    # Preserve the original nearest-coordinate validity rule exactly. Pillow's
-    # nearest filter differs at a few half-pixel ties.
-    source_x = (
-        matrix[0, 0] * destination_x
-        + matrix[0, 1] * destination_y
-        + matrix[0, 2]
-    )
-    source_y = (
-        matrix[1, 0] * destination_x
-        + matrix[1, 1] * destination_y
-        + matrix[1, 2]
-    )
-    nearest_x = np.rint(source_x)
-    nearest_y = np.rint(source_y)
-    valid = (
-        (nearest_x >= 0)
-        & (nearest_x < source_width)
-        & (nearest_y >= 0)
-        & (nearest_y < source_height)
-    )
+    if workspace is None:
+        # Preserve the original nearest-coordinate validity rule exactly.
+        # Pillow's nearest filter differs at a few half-pixel ties.
+        source_x = (
+            matrix[0, 0] * destination_x
+            + matrix[0, 1] * destination_y
+            + matrix[0, 2]
+        )
+        source_y = (
+            matrix[1, 0] * destination_x
+            + matrix[1, 1] * destination_y
+            + matrix[1, 2]
+        )
+        nearest_x = np.rint(source_x)
+        nearest_y = np.rint(source_y)
+        valid = (
+            (nearest_x >= 0)
+            & (nearest_x < source_width)
+            & (nearest_y >= 0)
+            & (nearest_y < source_height)
+        )
+        edge = valid & (
+            (source_x < 0)
+            | (source_x > source_width - 1)
+            | (source_y < 0)
+            | (source_y > source_height - 1)
+        )
+    else:
+        source_x, source_y, valid, edge = workspace.map_coordinates(matrix)
 
     # Pillow extends edge pixels during bilinear sampling, while ECC uses a
     # zero-valued constant border. Only the narrow valid perimeter can observe
     # that difference, so resample those pixels with the original arithmetic.
-    edge = valid & (
-        (source_x < 0)
-        | (source_x > source_width - 1)
-        | (source_y < 0)
-        | (source_y > source_height - 1)
-    )
     edge_y, edge_x = np.nonzero(edge)
     if edge_x.size:
         sample_x = source_x[edge_y, edge_x]
@@ -1210,16 +1336,24 @@ def _warp_ecc_channels_pillow(
     else:
         repaired_edge = None
 
-    if futures:
-        for future in futures:
+    future_error: Exception | None = None
+    for future in futures:
+        try:
             future.result()
+        except Exception as exc:
+            # Drain every disjoint worker before a caller retries with the
+            # public path and writes into these same reusable destinations.
+            if future_error is None:
+                future_error = exc
+    if future_error is not None:
+        raise future_error
     if repaired_edge is not None:
         warped[:, edge_y, edge_x] = repaired_edge
     return warped, valid
 
 
 class _EccChannelWarper:
-    """Reuse Pillow inputs and permanently fall back after an accelerator error."""
+    """Reuse ECC warp storage and preserve two compatibility fallbacks."""
 
     def __init__(
         self,
@@ -1233,9 +1367,17 @@ class _EccChannelWarper:
         self._destination_x = destination_x
         self._destination_y = destination_y
         self._source_images: tuple[Image.Image, ...] | None = None
+        self._output_images: tuple[Image.Image, ...] | None = None
+        self._workspace: _EccChannelWarpWorkspace | None = None
         self._executor: ThreadPoolExecutor | None = None
         try:
             self._source_images = _prepare_ecc_channel_images(padded_channels)
+            self._workspace = _EccChannelWarpWorkspace(
+                source_shape,
+                destination_x,
+                destination_y,
+                len(self._source_images),
+            )
             # Pillow's compiled transforms release the GIL. The independent
             # intensity/x-gradient/y-gradient warps can therefore run together.
             self._executor = ThreadPoolExecutor(
@@ -1244,7 +1386,28 @@ class _EccChannelWarper:
             )
         except (OSError, RuntimeError, TypeError, ValueError):
             self._source_images = None
+            self._workspace = None
             self._executor = None
+            return
+
+        try:
+            destination_size = (destination_x.shape[1], destination_y.shape[0])
+            output_images = tuple(
+                Image.new("F", destination_size, 0.0)
+                for _ in self._source_images
+            )
+            for image in output_images:
+                image.load()
+            if all(
+                callable(getattr(image.im, "transform", None))
+                or callable(getattr(image.im, "transform2", None))
+                for image in output_images
+            ):
+                self._output_images = output_images
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            # Public Image.transform remains available on unsupported Pillow
+            # cores; it is slower because it allocates a destination each time.
+            self._output_images = None
 
     def __enter__(self) -> _EccChannelWarper:
         return self
@@ -1260,20 +1423,39 @@ class _EccChannelWarper:
     def _disable_accelerator(self) -> None:
         self.close()
         self._source_images = None
+        self._output_images = None
+        self._workspace = None
+
+    def _warp_pillow(
+        self,
+        matrix: np.ndarray,
+        output_images: tuple[Image.Image, ...] | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        assert self._source_images is not None
+        return _warp_ecc_channels_pillow(
+            self._padded_channels,
+            self._source_shape,
+            matrix,
+            self._destination_x,
+            self._destination_y,
+            self._source_images,
+            self._executor,
+            workspace=self._workspace,
+            output_images=output_images,
+        )
 
     def warp(self, matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if self._source_images is not None:
+            if self._output_images is not None:
+                try:
+                    return self._warp_pillow(matrix, self._output_images)
+                except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                    # A private Pillow core mismatch must not take down its
+                    # stable public transform path. Do not retry it again.
+                    self._output_images = None
             try:
-                return _warp_ecc_channels_pillow(
-                    self._padded_channels,
-                    self._source_shape,
-                    matrix,
-                    self._destination_x,
-                    self._destination_y,
-                    self._source_images,
-                    self._executor,
-                )
-            except (OSError, RuntimeError, ValueError):
+                return self._warp_pillow(matrix, None)
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
                 self._disable_accelerator()
         return _warp_ecc_channels_numpy(
             self._padded_channels,

@@ -823,6 +823,168 @@ def test_parallel_pillow_ecc_warp_matches_serial_output() -> None:
     np.testing.assert_array_equal(actual[1], expected[1])
 
 
+@pytest.mark.parametrize("source_shape", [(5, 7), (6, 8)])
+def test_reused_pillow_ecc_warp_matches_fresh_outputs_over_changing_matrices(
+    source_shape: tuple[int, int],
+) -> None:
+    height, width = source_shape
+    rng = np.random.default_rng(421 + height)
+    source = rng.normal(size=(height, width, 3)).astype(np.float32)
+    padded = np.pad(source, ((1, 1), (1, 1), (0, 0)), mode="constant")
+    destination_x = np.arange(width, dtype=np.float32)[np.newaxis, :]
+    destination_y = np.arange(height, dtype=np.float32)[:, np.newaxis]
+    source_images = engine._prepare_ecc_channel_images(padded)
+    workspace = engine._EccChannelWarpWorkspace(
+        source_shape,
+        destination_x,
+        destination_y,
+        len(source_images),
+    )
+    output_images = tuple(
+        Image.new("F", (width, height), 0.0) for _ in source_images
+    )
+    matrices = (
+        np.array([[1.0, 0.0, 0.25], [0.0, 1.0, -0.4]], dtype=np.float32),
+        np.array([[1.0, 0.0, width + 2.5], [0.0, 1.0, height + 1.5]], dtype=np.float32),
+        np.array([[0.999, -0.031, -0.65], [0.031, 0.999, 0.55]], dtype=np.float32),
+    )
+
+    with engine.ThreadPoolExecutor(max_workers=len(source_images)) as executor:
+        for matrix in matrices:
+            expected = engine._warp_ecc_channels_pillow(
+                padded,
+                source_shape,
+                matrix,
+                destination_x,
+                destination_y,
+                source_images,
+                None,
+            )
+            actual = engine._warp_ecc_channels_pillow(
+                padded,
+                source_shape,
+                matrix,
+                destination_x,
+                destination_y,
+                source_images,
+                executor,
+                workspace=workspace,
+                output_images=output_images,
+            )
+            np.testing.assert_array_equal(actual[0], expected[0])
+            np.testing.assert_array_equal(actual[1], expected[1])
+
+
+@pytest.mark.parametrize("source_shape", [(5, 7), (6, 8)])
+def test_ecc_channel_warp_workspace_matches_original_coordinate_masks(
+    source_shape: tuple[int, int],
+) -> None:
+    height, width = source_shape
+    destination_x = np.arange(width, dtype=np.float32)[np.newaxis, :]
+    destination_y = np.arange(height, dtype=np.float32)[:, np.newaxis]
+    workspace = engine._EccChannelWarpWorkspace(
+        source_shape,
+        destination_x,
+        destination_y,
+        3,
+    )
+    rng = np.random.default_rng(991 + height)
+    matrices = [
+        np.array([[1, 0, -0.5], [0, 1, -0.5]], dtype=np.float32),
+        np.array(
+            [[1, 0, width - 0.5], [0, 1, height - 0.5]],
+            dtype=np.float32,
+        ),
+    ]
+    for _ in range(20):
+        matrices.append(
+            np.array(
+                [
+                    [rng.uniform(0.9, 1.1), rng.uniform(-0.1, 0.1), rng.uniform(-2, 2)],
+                    [rng.uniform(-0.1, 0.1), rng.uniform(0.9, 1.1), rng.uniform(-2, 2)],
+                ],
+                dtype=np.float32,
+            )
+        )
+
+    for matrix in matrices:
+        expected_x = (
+            matrix[0, 0] * destination_x
+            + matrix[0, 1] * destination_y
+            + matrix[0, 2]
+        )
+        expected_y = (
+            matrix[1, 0] * destination_x
+            + matrix[1, 1] * destination_y
+            + matrix[1, 2]
+        )
+        nearest_x = np.rint(expected_x)
+        nearest_y = np.rint(expected_y)
+        expected_valid = (
+            (nearest_x >= 0)
+            & (nearest_x < width)
+            & (nearest_y >= 0)
+            & (nearest_y < height)
+        )
+        expected_edge = expected_valid & (
+            (expected_x < 0)
+            | (expected_x > width - 1)
+            | (expected_y < 0)
+            | (expected_y > height - 1)
+        )
+
+        source_x, source_y, valid, edge = workspace.map_coordinates(matrix)
+
+        np.testing.assert_array_equal(source_x, expected_x)
+        np.testing.assert_array_equal(source_y, expected_y)
+        np.testing.assert_array_equal(valid, expected_valid)
+        np.testing.assert_array_equal(edge, expected_edge)
+
+
+def test_ecc_warper_disables_failed_private_transform_and_keeps_public_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = np.arange(7 * 9 * 3, dtype=np.float32).reshape(7, 9, 3)
+    padded = np.pad(source, ((1, 1), (1, 1), (0, 0)), mode="constant")
+    matrix = np.array([[1, 0, 0.25], [0, 1, -0.4]], dtype=np.float32)
+    destination_x = np.arange(source.shape[1], dtype=np.float32)[np.newaxis, :]
+    destination_y = np.arange(source.shape[0], dtype=np.float32)[:, np.newaxis]
+    source_images = engine._prepare_ecc_channel_images(padded)
+    expected = engine._warp_ecc_channels_pillow(
+        padded,
+        source.shape[:2],
+        matrix,
+        destination_x,
+        destination_y,
+        source_images,
+        None,
+    )
+    private_calls = 0
+
+    def unavailable(*_args, **_kwargs):
+        nonlocal private_calls
+        private_calls += 1
+        raise OSError("reusable Pillow destination unavailable")
+
+    monkeypatch.setattr(engine, "_transform_ecc_channel_reused", unavailable)
+    with engine._EccChannelWarper(
+        padded,
+        source.shape[:2],
+        destination_x,
+        destination_y,
+    ) as warper:
+        first = warper.warp(matrix)
+        calls_after_failure = private_calls
+        second = warper.warp(matrix)
+
+    np.testing.assert_array_equal(first[0], expected[0])
+    np.testing.assert_array_equal(first[1], expected[1])
+    np.testing.assert_array_equal(second[0], expected[0])
+    np.testing.assert_array_equal(second[1], expected[1])
+    assert calls_after_failure == len(source_images)
+    assert private_calls == calls_after_failure
+
+
 def test_pillow_ecc_warp_falls_back_to_numpy(monkeypatch) -> None:
     source = np.arange(7 * 9 * 3, dtype=np.float32).reshape(7, 9, 3)
     padded = np.pad(source, ((1, 1), (1, 1), (0, 0)), mode="constant")
@@ -844,6 +1006,7 @@ def test_pillow_ecc_warp_falls_back_to_numpy(monkeypatch) -> None:
         transform_calls += 1
         raise OSError("compiled affine sampler unavailable")
 
+    monkeypatch.setattr(engine, "_transform_ecc_channel_reused", unavailable)
     monkeypatch.setattr(engine.Image.Image, "transform", unavailable)
     with engine._EccChannelWarper(
         padded,
