@@ -3,14 +3,16 @@ from __future__ import annotations
 import cv2
 import numpy as np
 from PyQt6.QtCore import QAbstractAnimation, QPoint, QPointF, Qt
-from PyQt6.QtGui import QWheelEvent
+from PyQt6.QtGui import QImage, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import QGraphicsView
 
+import pdf_differences_viewer.graphics as graphics_module
 from pdf_differences_viewer.colors import DifferenceColors
 from pdf_differences_viewer.engine import compare_page_images
 from pdf_differences_viewer.graphics import (
     ChangeBoxPulseSettings,
     ComparisonGraphicsWidget,
+    bgra_to_pixmap,
 )
 
 
@@ -19,6 +21,69 @@ def _result_with_region():
     new = old.copy()
     cv2.circle(new, (80, 60), 14, (0, 0, 0), thickness=-1)
     return compare_page_images(old, new, tolerance_px=0, minimum_region_area=4)
+
+
+def _reference_pixmap(array: np.ndarray) -> QPixmap:
+    """Reproduce the original explicit BGR(A)-to-RGB(A) conversion."""
+    order = [2, 1, 0, 3] if array.shape[2] == 4 else [2, 1, 0]
+    pixels = np.ascontiguousarray(array[:, :, order])
+    image_format = (
+        QImage.Format.Format_RGBA8888
+        if array.shape[2] == 4
+        else QImage.Format.Format_RGB888
+    )
+    image = QImage(
+        pixels.data,
+        pixels.shape[1],
+        pixels.shape[0],
+        pixels.strides[0],
+        image_format,
+    ).copy()
+    return QPixmap.fromImage(image)
+
+
+def _rgba_pixels(pixmap: QPixmap) -> bytes:
+    image = pixmap.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+    return bytes(image.constBits().asstring(image.sizeInBytes()))
+
+
+def test_bgra_to_pixmap_matches_original_colors_and_owns_its_pixels(qapp) -> None:
+    source = np.array(
+        [
+            [[3, 29, 241, 255], [213, 81, 17, 180]],
+            [[99, 42, 7, 96], [255, 255, 255, 0]],
+        ],
+        dtype=np.uint8,
+    )
+    expected = _reference_pixmap(source)
+    actual = bgra_to_pixmap(source)
+
+    # The returned pixmap must not retain a borrowed view of the result array.
+    source.fill(0)
+
+    assert _rgba_pixels(actual) == _rgba_pixels(expected)
+
+
+def test_bgra_to_pixmap_retains_three_channel_and_noncontiguous_support(qapp) -> None:
+    storage = np.arange(8 * 10 * 3, dtype=np.uint8).reshape(8, 10, 3)
+    source = storage[::2, 1::2]
+    assert not source.flags.c_contiguous
+    expected = _reference_pixmap(source)
+    actual = bgra_to_pixmap(source)
+
+    storage.fill(0)
+
+    assert _rgba_pixels(actual) == _rgba_pixels(expected)
+
+
+def test_bgra_to_pixmap_big_endian_fallback_matches_original(qapp, monkeypatch) -> None:
+    source = np.arange(5 * 7 * 4, dtype=np.uint8).reshape(5, 7, 4)
+    expected = _reference_pixmap(source)
+    monkeypatch.setattr(graphics_module, "byteorder", "big")
+
+    actual = bgra_to_pixmap(source)
+
+    assert _rgba_pixels(actual) == _rgba_pixels(expected)
 
 
 def test_scene_uses_native_layers_and_blend_opacity(qapp) -> None:
