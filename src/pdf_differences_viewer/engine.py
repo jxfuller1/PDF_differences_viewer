@@ -270,8 +270,27 @@ def _bgr_to_bgra(bgr: np.ndarray) -> np.ndarray:
 
 
 def _bgr_to_gray(bgr: np.ndarray) -> np.ndarray:
-    """Convert BGR to luma with the standard BT.601 integer coefficients."""
+    """Convert BGR to luma with the standard BT.601 integer coefficients.
+
+    PDF drawings are commonly monochrome RGB rasters. Because the integer
+    coefficients sum to the luma scale, equal B/G/R channels map exactly to
+    that shared channel. A cheap sample avoids full equality scans for ordinary
+    color images; the complete checks keep this fast path exact.
+    """
     channels = bgr[:, :, :3]
+    if channels.dtype == np.uint8:
+        stride = InkMaskSettings.COLOR_SAMPLE_STRIDE
+        sample = channels[::stride, ::stride]
+        if (
+            np.array_equal(sample[:, :, 0], sample[:, :, 1])
+            and np.array_equal(sample[:, :, 0], sample[:, :, 2])
+        ):
+            blue = channels[:, :, 0]
+            if np.array_equal(blue, channels[:, :, 1]) and np.array_equal(
+                blue,
+                channels[:, :, 2],
+            ):
+                return np.ascontiguousarray(blue)
     if channels.dtype != np.uint8:
         channels = channels.astype(np.uint32, copy=False)
     weighted = np.einsum(
