@@ -1096,6 +1096,53 @@ def test_sparse_binary_mask_dilation_matches_opencv_at_page_edges() -> None:
         np.testing.assert_array_equal(_dilate_binary_mask(mask, kernel_size), expected)
 
 
+def test_run_based_binary_mask_dilation_matches_integral_path() -> None:
+    rng = np.random.default_rng(71)
+    masks = [
+        np.zeros((1, 1), dtype=np.uint8),
+        np.full((9, 11), 255, dtype=np.uint8),
+    ]
+    masks.extend(
+        np.where(rng.random((37, 53)) < probability, 255, 0).astype(np.uint8)
+        for probability in (0.01, 0.08, 0.35, 0.8)
+    )
+    masks[2][0, 0] = masks[2][-1, -1] = 255
+
+    for mask in masks:
+        foreground = np.ascontiguousarray(mask > 0)
+        foreground_runs = engine._foreground_run_table(foreground)
+        for kernel_size in (2, 3, 4, 9, 20, 31):
+            expected = engine._dilate_binary_mask_integral(mask, kernel_size)
+            actual = engine._dilate_binary_runs_qt(
+                mask.shape,
+                kernel_size,
+                *foreground_runs,
+            )
+            np.testing.assert_array_equal(actual, expected)
+
+
+def test_regions_dispatches_run_dilation_and_retains_integral_fallback(monkeypatch) -> None:
+    mask = np.zeros((200, 300), dtype=np.uint8)
+    mask[50:60, 30:270] = 255
+    run_calls = 0
+    run_dilation = engine._dilate_binary_runs_qt
+
+    def record_run_dilation(*args):
+        nonlocal run_calls
+        run_calls += 1
+        return run_dilation(*args)
+
+    monkeypatch.setattr(engine, "_dilate_binary_runs_qt", record_run_dilation)
+    expected = _regions(mask, "added", 4, 20)
+    assert run_calls == 1
+
+    def unavailable_run_dilation(*args):
+        raise RuntimeError("Qt raster path unavailable")
+
+    monkeypatch.setattr(engine, "_dilate_binary_runs_qt", unavailable_run_dilation)
+    assert _regions(mask, "added", 4, 20) == expected
+
+
 def _write_pdf(path, *, add_circle: bool) -> None:
     document = fitz.open()
     page = document.new_page(width=240, height=180)
