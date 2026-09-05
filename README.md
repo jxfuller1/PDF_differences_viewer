@@ -17,6 +17,8 @@ This reduces the package size quite a bit.   This implementation runs faster tha
 - Opens an old and a new PDF, with a selectable page in each document.
 - Rasterizes and aligns the old drawing to the new one before calculating the
   difference, which reduces false positives caused by small page shifts.
+- Accelerates large phase-correlation FFTs across the available CPU cores when
+  RAM permits, with an automatic fallback to the established implementation.
 - Displays the old drawing, new drawing, bright-blue additions, and bright-red removals as
   independent `QGraphicsPixmapItem` layers.
 - Provides a smooth old-to-new review slider, independent addition/removal

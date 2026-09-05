@@ -9,6 +9,8 @@ small rasterisation shifts therefore do not become differences.
 from __future__ import annotations
 
 import ctypes
+import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -99,6 +101,15 @@ class PhaseCorrelationSettings:
     OPTIMAL_DFT_FACTORS = (2, 3, 5)
     CENTROID_RADIUS = 2
     PARALLEL_FORWARD_MIN_PIXELS = 300_000
+    CHUNKED_FFT_MIN_PIXELS = 750_000
+    CHUNKED_FFT_MAX_WORKERS = 8
+    CHUNKED_FFT_ROW_BLOCK = 64
+    CHUNKED_FFT_COLUMN_BLOCK = 8
+    CHUNKED_FFT_MEMORY_RESERVE_BYTES = 1 << 30
+    CHUNKED_FFT_MAX_AVAILABLE_MEMORY_FRACTION = 0.50
+    CHUNKED_FFT_MEMORY_SAFETY_NUMERATOR = 5
+    CHUNKED_FFT_MEMORY_SAFETY_DENOMINATOR = 4
+    CHUNKED_FFT_FIXED_MEMORY_ALLOWANCE_BYTES = 32 << 20
 
 
 class DistanceTransformSettings:
@@ -706,6 +717,341 @@ def _optimal_dft_size(size: int) -> int:
         candidate += 1
 
 
+def _read_memory_counter(path: Path) -> int | None:
+    """Read a non-negative byte count, ignoring unavailable/unlimited files."""
+    try:
+        value = path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return None
+    if not value or value == "max":
+        return None
+    try:
+        counter = int(value)
+    except ValueError:
+        return None
+    # Linux cgroup v1 sometimes reports an enormous sentinel for no limit.
+    return counter if 0 <= counter < (1 << 60) else None
+
+
+def _linux_cgroup_available_memory_bytes() -> int | None:
+    """Return remaining cgroup memory for common v1/v2 mount layouts."""
+    candidates = (
+        (
+            Path("/sys/fs/cgroup/memory.max"),
+            Path("/sys/fs/cgroup/memory.current"),
+        ),
+        (
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+        ),
+    )
+    remaining: list[int] = []
+    for limit_path, usage_path in candidates:
+        limit = _read_memory_counter(limit_path)
+        usage = _read_memory_counter(usage_path)
+        if limit is not None and usage is not None:
+            remaining.append(max(0, limit - usage))
+    return min(remaining) if remaining else None
+
+
+def _available_physical_memory_bytes() -> int | None:
+    """Return safely allocatable physical memory without optional packages.
+
+    Unknown platforms deliberately return ``None``. The accelerated FFT then
+    stays disabled rather than guessing and potentially forcing the operating
+    system to page hundreds of megabytes.
+    """
+    if sys.platform == "win32":
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = (
+                ("length", ctypes.c_ulong),
+                ("memory_load", ctypes.c_ulong),
+                ("total_physical", ctypes.c_ulonglong),
+                ("available_physical", ctypes.c_ulonglong),
+                ("total_page_file", ctypes.c_ulonglong),
+                ("available_page_file", ctypes.c_ulonglong),
+                ("total_virtual", ctypes.c_ulonglong),
+                ("available_virtual", ctypes.c_ulonglong),
+                ("available_extended_virtual", ctypes.c_ulonglong),
+            )
+
+        try:
+            status = MemoryStatusEx()
+            status.length = ctypes.sizeof(status)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return None
+        except (AttributeError, OSError, ValueError):
+            return None
+        return int(status.available_physical)
+
+    host_available: int | None = None
+    if sys.platform.startswith("linux"):
+        try:
+            for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+                if line.startswith("MemAvailable:"):
+                    host_available = int(line.split()[1]) * 1024
+                    break
+        except (IndexError, OSError, UnicodeError, ValueError):
+            pass
+
+    if host_available is None:
+        try:
+            host_available = int(os.sysconf("SC_AVPHYS_PAGES")) * int(
+                os.sysconf("SC_PAGE_SIZE")
+            )
+        except (AttributeError, OSError, TypeError, ValueError):
+            host_available = None
+
+    if sys.platform.startswith("linux"):
+        cgroup_available = _linux_cgroup_available_memory_bytes()
+        if cgroup_available is not None:
+            return (
+                min(host_available, cgroup_available)
+                if host_available is not None
+                else cgroup_available
+            )
+    return host_available
+
+
+@lru_cache(maxsize=4)
+def _phase_fft_dtypes(input_dtype: np.dtype) -> tuple[np.dtype, np.dtype]:
+    """Return NumPy's actual spectrum/correlation dtypes for this build."""
+    source = np.zeros(2, dtype=input_dtype)
+    spectrum = np.fft.rfft(source, n=2)
+    correlation = np.fft.irfft(spectrum, n=2)
+    return spectrum.dtype, correlation.dtype
+
+
+def _phase_chunk_task_count(length: int, block_size: int) -> int:
+    return (length + block_size - 1) // block_size
+
+
+def _phase_chunked_fft_memory_bytes(
+    source_shape: tuple[int, int],
+    padded_shape: tuple[int, int],
+    input_dtype: np.dtype,
+    workers: int,
+) -> int:
+    """Conservatively estimate peak allocations made by the chunked FFT."""
+    source_height, _ = source_shape
+    padded_height, padded_width = padded_shape
+    half_width = padded_width // 2 + 1
+    spectrum_dtype, correlation_dtype = _phase_fft_dtypes(np.dtype(input_dtype))
+    complex_size = spectrum_dtype.itemsize
+    real_size = correlation_dtype.itemsize
+    spectrum_bytes = padded_height * half_width * complex_size
+    correlation_bytes = padded_height * padded_width * real_size
+
+    row_block = min(source_height, PhaseCorrelationSettings.CHUNKED_FFT_ROW_BLOCK)
+    row_tasks = min(
+        workers,
+        _phase_chunk_task_count(
+            source_height,
+            PhaseCorrelationSettings.CHUNKED_FFT_ROW_BLOCK,
+        ),
+    )
+    forward_row_scratch = row_tasks * row_block * (
+        padded_width * real_size + half_width * complex_size
+    )
+    column_block = min(half_width, PhaseCorrelationSettings.CHUNKED_FFT_COLUMN_BLOCK)
+    column_tasks = min(
+        workers,
+        _phase_chunk_task_count(
+            half_width,
+            PhaseCorrelationSettings.CHUNKED_FFT_COLUMN_BLOCK,
+        ),
+    )
+    column_scratch = (
+        column_tasks * padded_height * column_block * complex_size * 2
+    )
+    inverse_row_block = min(
+        padded_height,
+        PhaseCorrelationSettings.CHUNKED_FFT_ROW_BLOCK,
+    )
+    inverse_row_tasks = min(
+        workers,
+        _phase_chunk_task_count(
+            padded_height,
+            PhaseCorrelationSettings.CHUNKED_FFT_ROW_BLOCK,
+        ),
+    )
+    inverse_row_scratch = inverse_row_tasks * inverse_row_block * (
+        half_width * complex_size + padded_width * real_size
+    )
+
+    forward_peak = 2 * spectrum_bytes + max(forward_row_scratch, column_scratch)
+    inverse_peak = spectrum_bytes + correlation_bytes + max(
+        column_scratch,
+        inverse_row_scratch,
+    )
+    estimate = max(forward_peak, inverse_peak)
+    estimate *= PhaseCorrelationSettings.CHUNKED_FFT_MEMORY_SAFETY_NUMERATOR
+    estimate = (
+        estimate
+        + PhaseCorrelationSettings.CHUNKED_FFT_MEMORY_SAFETY_DENOMINATOR
+        - 1
+    ) // PhaseCorrelationSettings.CHUNKED_FFT_MEMORY_SAFETY_DENOMINATOR
+    return estimate + PhaseCorrelationSettings.CHUNKED_FFT_FIXED_MEMORY_ALLOWANCE_BYTES
+
+
+def _phase_available_cpu_count() -> int:
+    """Return logical CPUs available to this process, respecting affinity."""
+    available = cpu_count() or 1
+    affinity_count = 0
+    if sys.platform == "win32":
+        try:
+            process_mask = ctypes.c_size_t()
+            system_mask = ctypes.c_size_t()
+            process = ctypes.c_void_p(-1)  # GetCurrentProcess pseudo-handle.
+            if ctypes.windll.kernel32.GetProcessAffinityMask(
+                process,
+                ctypes.byref(process_mask),
+                ctypes.byref(system_mask),
+            ):
+                affinity_count = int(process_mask.value).bit_count()
+        except (AttributeError, ctypes.ArgumentError, OSError, ValueError):
+            pass
+    else:
+        get_affinity = getattr(os, "sched_getaffinity", None)
+        if get_affinity is not None:
+            try:
+                affinity_count = len(get_affinity(0))
+            except (OSError, TypeError, ValueError):
+                pass
+    if affinity_count > 0:
+        available = min(available, affinity_count)
+    return max(1, available)
+
+
+def _phase_chunked_fft_workers(
+    source_shape: tuple[int, int],
+    padded_shape: tuple[int, int],
+    input_dtype: np.dtype,
+) -> int:
+    """Choose the fast-path worker count only when CPU and RAM allow it."""
+    if padded_shape[0] * padded_shape[1] < PhaseCorrelationSettings.CHUNKED_FFT_MIN_PIXELS:
+        return 0
+    workers = min(
+        _phase_available_cpu_count(),
+        PhaseCorrelationSettings.CHUNKED_FFT_MAX_WORKERS,
+    )
+    if workers < 2:
+        return 0
+    available = _available_physical_memory_bytes()
+    if available is None:
+        return 0
+    required = _phase_chunked_fft_memory_bytes(
+        source_shape,
+        padded_shape,
+        input_dtype,
+        workers,
+    )
+    if required > available * PhaseCorrelationSettings.CHUNKED_FFT_MAX_AVAILABLE_MEMORY_FRACTION:
+        return 0
+    if required + PhaseCorrelationSettings.CHUNKED_FFT_MEMORY_RESERVE_BYTES > available:
+        return 0
+    return workers
+
+
+def _phase_run_chunks(
+    executor: ThreadPoolExecutor,
+    length: int,
+    block_size: int,
+    operation: Callable[[int, int], None],
+) -> None:
+    """Run an operation over disjoint slices and propagate worker failures."""
+    futures = [
+        executor.submit(operation, start, min(length, start + block_size))
+        for start in range(0, length, block_size)
+    ]
+    try:
+        for future in futures:
+            future.result()
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        raise
+
+
+def _phase_chunked_forward(
+    image: np.ndarray,
+    padded_shape: tuple[int, int],
+    executor: ThreadPoolExecutor,
+) -> np.ndarray:
+    """Compute an exact rfft2 from independent row and column transforms."""
+    padded_height, padded_width = padded_shape
+    half_width = padded_width // 2 + 1
+    spectrum_dtype, _ = _phase_fft_dtypes(image.dtype)
+    spectrum = np.zeros((padded_height, half_width), dtype=spectrum_dtype)
+
+    def transform_rows(start: int, stop: int) -> None:
+        spectrum[start:stop] = np.fft.rfft(
+            image[start:stop],
+            n=padded_width,
+            axis=1,
+        )
+
+    _phase_run_chunks(
+        executor,
+        image.shape[0],
+        PhaseCorrelationSettings.CHUNKED_FFT_ROW_BLOCK,
+        transform_rows,
+    )
+
+    def transform_columns(start: int, stop: int) -> None:
+        spectrum[:, start:stop] = np.fft.fft(
+            spectrum[:, start:stop],
+            axis=0,
+        )
+
+    _phase_run_chunks(
+        executor,
+        half_width,
+        PhaseCorrelationSettings.CHUNKED_FFT_COLUMN_BLOCK,
+        transform_columns,
+    )
+    return spectrum
+
+
+def _phase_chunked_inverse(
+    spectrum: np.ndarray,
+    padded_shape: tuple[int, int],
+    executor: ThreadPoolExecutor,
+) -> np.ndarray:
+    """Compute an exact irfft2 while reusing the spectrum's column storage."""
+    padded_height, padded_width = padded_shape
+
+    def transform_columns(start: int, stop: int) -> None:
+        spectrum[:, start:stop] = np.fft.ifft(
+            spectrum[:, start:stop],
+            axis=0,
+        )
+
+    _phase_run_chunks(
+        executor,
+        spectrum.shape[1],
+        PhaseCorrelationSettings.CHUNKED_FFT_COLUMN_BLOCK,
+        transform_columns,
+    )
+    _, correlation_dtype = _phase_fft_dtypes(spectrum.real.dtype)
+    correlation = np.empty(padded_shape, dtype=correlation_dtype)
+
+    def transform_rows(start: int, stop: int) -> None:
+        correlation[start:stop] = np.fft.irfft(
+            spectrum[start:stop],
+            n=padded_width,
+            axis=1,
+        )
+
+    _phase_run_chunks(
+        executor,
+        padded_height,
+        PhaseCorrelationSettings.CHUNKED_FFT_ROW_BLOCK,
+        transform_rows,
+    )
+    return correlation
+
+
 def _phase_forward_spectra(
     first: np.ndarray,
     second: np.ndarray,
@@ -741,6 +1087,125 @@ def _phase_forward_spectra(
         executor.shutdown()
 
 
+def _normalize_phase_spectrum(
+    first_spectrum: np.ndarray,
+    second_spectrum: np.ndarray,
+    input_dtype: np.dtype,
+) -> None:
+    """Form and normalize the cross-power spectrum in reusable storage."""
+    np.conjugate(second_spectrum, out=second_spectrum)
+    np.multiply(first_spectrum, second_spectrum, out=first_spectrum)
+
+    # The second spectrum is dead after forming the cross-power product. Its
+    # complex storage holds exactly two real arrays, so reuse those contiguous
+    # halves for magnitude and normalization instead of allocating both.
+    real_dtype = first_spectrum.real.dtype
+    workspace = second_spectrum.view(real_dtype).reshape(-1)
+    spectrum_size = first_spectrum.size
+    magnitude = workspace[:spectrum_size].reshape(first_spectrum.shape)
+    normalizer = workspace[spectrum_size:].reshape(first_spectrum.shape)
+    np.abs(first_spectrum, out=magnitude)
+    floating_info = np.finfo(input_dtype)
+    # P * |P| / (|P|**2 + epsilon), rearranged to avoid overflow.
+    np.maximum(magnitude, floating_info.tiny, out=normalizer)
+    np.divide(floating_info.eps, normalizer, out=normalizer)
+    np.add(normalizer, magnitude, out=normalizer)
+    np.divide(first_spectrum, normalizer, out=first_spectrum)
+
+
+def _phase_peak(
+    correlation: np.ndarray,
+    padded_shape: tuple[int, int],
+) -> tuple[tuple[float, float], float]:
+    """Refine the unshifted correlation maximum with a 5x5 centroid."""
+    padded_height, padded_width = padded_shape
+    # Map only the peak's neighborhood into shifted coordinates instead of
+    # copying the complete correlation image with fftshift.
+    unshifted_y, unshifted_x = np.unravel_index(
+        np.argmax(correlation),
+        correlation.shape,
+    )
+    peak_y = (int(unshifted_y) + padded_height // 2) % padded_height
+    peak_x = (int(unshifted_x) + padded_width // 2) % padded_width
+    radius = PhaseCorrelationSettings.CENTROID_RADIUS
+    shifted_ys = np.arange(
+        max(0, peak_y - radius),
+        min(padded_height, peak_y + radius + 1),
+    )
+    shifted_xs = np.arange(
+        max(0, peak_x - radius),
+        min(padded_width, peak_x + radius + 1),
+    )
+    source_ys = (shifted_ys - padded_height // 2) % padded_height
+    source_xs = (shifted_xs - padded_width // 2) % padded_width
+    centroid_patch = correlation[np.ix_(source_ys, source_xs)].astype(
+        np.float64,
+        copy=False,
+    )
+    response = float(np.sum(centroid_patch, dtype=np.float64))
+    denominator = response + np.finfo(np.float64).eps
+    centroid_x = float(
+        np.sum(centroid_patch * shifted_xs[None, :], dtype=np.float64)
+        / denominator
+    )
+    centroid_y = float(
+        np.sum(centroid_patch * shifted_ys[:, None], dtype=np.float64)
+        / denominator
+    )
+    return (
+        (padded_width / 2.0 - centroid_x, padded_height / 2.0 - centroid_y),
+        response,
+    )
+
+
+def _phase_correlate_chunked(
+    first: np.ndarray,
+    second: np.ndarray,
+    padded_shape: tuple[int, int],
+    workers: int,
+) -> tuple[tuple[float, float], float]:
+    """Use bounded, intra-transform threading for large FFTs."""
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="pdf-phase-chunk",
+    ) as executor:
+        # Each 2-D transform uses every worker. Processing the inputs one at a
+        # time keeps only one bounded set of row/column scratch blocks alive.
+        first_spectrum = _phase_chunked_forward(first, padded_shape, executor)
+        second_spectrum = _phase_chunked_forward(second, padded_shape, executor)
+        _normalize_phase_spectrum(first_spectrum, second_spectrum, first.dtype)
+        # Release the reusable normalization workspace before allocating the
+        # full correlation image.
+        del second_spectrum
+        correlation = _phase_chunked_inverse(
+            first_spectrum,
+            padded_shape,
+            executor,
+        )
+    return _phase_peak(correlation, padded_shape)
+
+
+def _phase_correlate_standard(
+    first: np.ndarray,
+    second: np.ndarray,
+    padded_shape: tuple[int, int],
+) -> tuple[tuple[float, float], float]:
+    """Run the previous NumPy FFT implementation unchanged."""
+    first_spectrum, second_spectrum = _phase_forward_spectra(
+        first,
+        second,
+        padded_shape,
+    )
+    _normalize_phase_spectrum(first_spectrum, second_spectrum, first.dtype)
+    del second_spectrum
+    correlation = np.fft.irfft2(
+        first_spectrum,
+        s=padded_shape,
+        axes=(-2, -1),
+    )
+    return _phase_peak(correlation, padded_shape)
+
+
 def _phase_correlate(
     first: np.ndarray,
     second: np.ndarray,
@@ -765,54 +1230,25 @@ def _phase_correlate(
     padded_height = _optimal_dft_size(first.shape[0])
     padded_width = _optimal_dft_size(first.shape[1])
     padded_shape = (padded_height, padded_width)
-    first_spectrum, second_spectrum = _phase_forward_spectra(
-        first,
-        second,
+    workers = _phase_chunked_fft_workers(
+        first.shape,
         padded_shape,
+        first.dtype,
     )
-    np.conjugate(second_spectrum, out=second_spectrum)
-    np.multiply(first_spectrum, second_spectrum, out=first_spectrum)
-
-    # The second spectrum is dead after forming the cross-power product. Its
-    # complex storage holds exactly two real arrays, so reuse those contiguous
-    # halves for magnitude and normalization instead of allocating both.
-    real_dtype = first_spectrum.real.dtype
-    workspace = second_spectrum.view(real_dtype).reshape(-1)
-    spectrum_size = first_spectrum.size
-    magnitude = workspace[:spectrum_size].reshape(first_spectrum.shape)
-    normalizer = workspace[spectrum_size:].reshape(first_spectrum.shape)
-    np.abs(first_spectrum, out=magnitude)
-    floating_info = np.finfo(first.dtype)
-    # P * |P| / (|P|**2 + epsilon), rearranged to avoid overflow.
-    np.maximum(magnitude, floating_info.tiny, out=normalizer)
-    np.divide(floating_info.eps, normalizer, out=normalizer)
-    np.add(normalizer, magnitude, out=normalizer)
-    np.divide(first_spectrum, normalizer, out=first_spectrum)
-    correlation = np.fft.irfft2(first_spectrum, s=padded_shape, axes=(-2, -1))
-
-    # Locate the unshifted peak, then map only its 5x5 neighborhood into the
-    # shifted coordinate system. This avoids copying the full correlation map.
-    unshifted_y, unshifted_x = np.unravel_index(np.argmax(correlation), correlation.shape)
-    peak_y = (int(unshifted_y) + padded_height // 2) % padded_height
-    peak_x = (int(unshifted_x) + padded_width // 2) % padded_width
-    radius = PhaseCorrelationSettings.CENTROID_RADIUS
-    shifted_ys = np.arange(max(0, peak_y - radius), min(padded_height, peak_y + radius + 1))
-    shifted_xs = np.arange(max(0, peak_x - radius), min(padded_width, peak_x + radius + 1))
-    source_ys = (shifted_ys - padded_height // 2) % padded_height
-    source_xs = (shifted_xs - padded_width // 2) % padded_width
-    centroid_patch = correlation[np.ix_(source_ys, source_xs)].astype(np.float64, copy=False)
-    response = float(np.sum(centroid_patch, dtype=np.float64))
-    denominator = response + np.finfo(np.float64).eps
-    centroid_x = float(
-        np.sum(centroid_patch * shifted_xs[None, :], dtype=np.float64) / denominator
-    )
-    centroid_y = float(
-        np.sum(centroid_patch * shifted_ys[:, None], dtype=np.float64) / denominator
-    )
-    return (
-        (padded_width / 2.0 - centroid_x, padded_height / 2.0 - centroid_y),
-        response,
-    )
+    if workers >= 2:
+        try:
+            return _phase_correlate_chunked(
+                first,
+                second,
+                padded_shape,
+                workers,
+            )
+        except (MemoryError, OSError, RuntimeError):
+            # Available RAM can change between the guard and allocation, and
+            # embedded/frozen runtimes can reject worker creation. Preserve
+            # the established implementation in every resource-failure case.
+            pass
+    return _phase_correlate_standard(first, second, padded_shape)
 
 
 def _warp_binary_translation_nearest(
