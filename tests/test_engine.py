@@ -309,6 +309,133 @@ def test_pillow_resize_without_channel_reversals_matches_legacy_output(
     assert actual.flags.c_contiguous
 
 
+@pytest.mark.parametrize(
+    ("source_shape", "target_size"),
+    [
+        ((17, 23), (41, 29)),
+        ((41, 29), (17, 23)),
+        ((19, 31), (47, 13)),
+        ((37, 21), (13, 43)),
+    ],
+)
+def test_parallel_pillow_resize_is_byte_exact_for_color_images(
+    monkeypatch,
+    source_shape: tuple[int, int],
+    target_size: tuple[int, int],
+) -> None:
+    rng = np.random.default_rng(9151)
+    # Slicing a wider allocation also verifies the non-contiguous input path.
+    backing = rng.integers(
+        0,
+        256,
+        size=(source_shape[0], source_shape[1] * 2, 3),
+        dtype=np.uint8,
+    )
+    source = backing[:, ::2]
+    assert not source.flags.c_contiguous
+    target_width, target_height = target_size
+    resample = (
+        Image.Resampling.BOX
+        if source.shape[1] * source.shape[0] > target_width * target_height
+        else Image.Resampling.BICUBIC
+    )
+    expected = engine._resize_bgr_sequential(
+        source,
+        target_width,
+        target_height,
+        resample,
+    )
+    monkeypatch.setattr(engine, "_resize_parallel_worker_count", lambda *_args: 3)
+
+    actual = _resize_bgr(source, target_width, target_height)
+
+    np.testing.assert_array_equal(actual, expected)
+    assert actual.flags.c_contiguous
+
+
+def test_parallel_resize_worker_policy_accounts_for_cores_and_memory(monkeypatch) -> None:
+    source = np.empty((1200, 1600, 3), dtype=np.uint8)
+    target_width, target_height = 2400, 1800
+    monkeypatch.setattr(engine.ResizeSettings, "PARALLEL_MIN_OUTPUT_PIXELS", 0)
+    monkeypatch.setattr(engine, "_available_cpu_count", lambda: 3)
+    monkeypatch.setattr(engine, "_available_physical_memory_bytes", lambda: None)
+
+    assert engine._resize_parallel_worker_count(source, target_width, target_height) == 0
+
+    required = engine._resize_parallel_memory_bytes(
+        source.shape[:2],
+        target_width,
+        target_height,
+        3,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_available_physical_memory_bytes",
+        lambda: required + engine.ResizeSettings.MEMORY_RESERVE_BYTES - 1,
+    )
+    assert engine._resize_parallel_worker_count(source, target_width, target_height) == 0
+
+    monkeypatch.setattr(engine.ResizeSettings, "MEMORY_RESERVE_BYTES", 0)
+    monkeypatch.setattr(
+        engine,
+        "_available_physical_memory_bytes",
+        lambda: required * 2 - 1,
+    )
+    assert engine._resize_parallel_worker_count(source, target_width, target_height) == 0
+
+    ample_memory = max(
+        required * 3,
+        required + engine.ResizeSettings.MEMORY_RESERVE_BYTES + 1,
+    )
+    monkeypatch.setattr(engine, "_available_physical_memory_bytes", lambda: ample_memory)
+    assert engine._resize_parallel_worker_count(source, target_width, target_height) == 3
+
+    monkeypatch.setattr(engine, "_available_cpu_count", lambda: 2)
+    assert engine._resize_parallel_worker_count(source, target_width, target_height) == 0
+
+    monkeypatch.setattr(engine, "_available_cpu_count", lambda: 1)
+    assert engine._resize_parallel_worker_count(source, target_width, target_height) == 0
+
+
+def test_parallel_resize_falls_back_when_executor_is_unavailable(monkeypatch) -> None:
+    rng = np.random.default_rng(9161)
+    source = rng.integers(0, 256, size=(31, 47, 3), dtype=np.uint8)
+    expected = engine._resize_bgr_sequential(
+        source,
+        83,
+        59,
+        Image.Resampling.BICUBIC,
+    )
+
+    class UnavailableExecutor:
+        def __init__(self, **_kwargs) -> None:
+            raise RuntimeError("worker threads unavailable in frozen runtime")
+
+    monkeypatch.setattr(engine, "_resize_parallel_worker_count", lambda *_args: 3)
+    monkeypatch.setattr(engine, "ThreadPoolExecutor", UnavailableExecutor)
+
+    np.testing.assert_array_equal(_resize_bgr(source, 83, 59), expected)
+
+
+def test_parallel_resize_falls_back_after_allocation_race(monkeypatch) -> None:
+    rng = np.random.default_rng(9173)
+    source = rng.integers(0, 256, size=(29, 43, 3), dtype=np.uint8)
+    expected = engine._resize_bgr_sequential(
+        source,
+        79,
+        61,
+        Image.Resampling.BICUBIC,
+    )
+
+    def unavailable(*_args, **_kwargs):
+        raise MemoryError("simulated allocation race")
+
+    monkeypatch.setattr(engine, "_resize_parallel_worker_count", lambda *_args: 3)
+    monkeypatch.setattr(engine, "_resize_bgr_channel", unavailable)
+
+    np.testing.assert_array_equal(_resize_bgr(source, 79, 61), expected)
+
+
 def test_numpy_binary_translation_matches_opencv_nearest_inverse_warp() -> None:
     rng = np.random.default_rng(47)
     source = np.where(rng.random((17, 23)) < 0.22, 1, 0).astype(np.uint8)
