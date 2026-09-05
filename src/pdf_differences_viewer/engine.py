@@ -11,7 +11,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import lru_cache
 from math import asin, atan2, cos, degrees, hypot, sin
@@ -62,6 +62,18 @@ class InkMaskSettings:
     CHUNK_ROWS = 128
     COLOR_SAMPLE_STRIDE = 32
     SPARSE_COLOR_MAX_FRACTION = 0.03
+
+
+class ResizeSettings:
+    """Resource limits for exact concurrent Pillow channel resizing."""
+
+    PARALLEL_MIN_OUTPUT_PIXELS = 4_000_000
+    PARALLEL_WORKERS = 3
+    MEMORY_RESERVE_BYTES = 1 << 30
+    MAX_AVAILABLE_MEMORY_FRACTION = 0.50
+    MEMORY_SAFETY_NUMERATOR = 5
+    MEMORY_SAFETY_DENOMINATOR = 4
+    FIXED_MEMORY_ALLOWANCE_BYTES = 32 << 20
 
 
 class AlignmentSettings:
@@ -332,12 +344,137 @@ def _bgr_to_gray(bgr: np.ndarray) -> np.ndarray:
     return weighted.astype(np.uint8)
 
 
+def _resize_bgr_sequential(
+    image: np.ndarray,
+    target_width: int,
+    target_height: int,
+    resample: Image.Resampling,
+) -> np.ndarray:
+    """Run the established single-image Pillow resize implementation."""
+    bgr = Image.fromarray(np.ascontiguousarray(image))
+    resized_bgr = bgr.resize((target_width, target_height), resample=resample)
+    return np.asarray(resized_bgr)
+
+
+def _resize_bgr_channel(
+    image: np.ndarray,
+    channel_index: int,
+    target_width: int,
+    target_height: int,
+    resample: Image.Resampling,
+) -> np.ndarray:
+    """Resize one channel independently using Pillow's identical filter."""
+    channel = Image.fromarray(np.ascontiguousarray(image[:, :, channel_index]))
+    resized = channel.resize((target_width, target_height), resample=resample)
+    return np.asarray(resized)
+
+
+def _resize_bgr_channels_parallel(
+    image: np.ndarray,
+    target_width: int,
+    target_height: int,
+    resample: Image.Resampling,
+    workers: int,
+) -> np.ndarray:
+    """Resize independent BGR planes concurrently and restore channel order."""
+    result = np.empty((target_height, target_width, 3), dtype=np.uint8)
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="pdf-resize",
+    ) as executor:
+        futures = {
+            executor.submit(
+                _resize_bgr_channel,
+                image,
+                channel_index,
+                target_width,
+                target_height,
+                resample,
+            ): channel_index
+            for channel_index in range(3)
+        }
+        try:
+            for future in as_completed(futures):
+                channel_index = futures[future]
+                result[:, :, channel_index] = future.result()
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+    return result
+
+
+def _resize_parallel_memory_bytes(
+    source_shape: tuple[int, int],
+    target_width: int,
+    target_height: int,
+    workers: int,
+) -> int:
+    """Conservatively estimate allocations for concurrent channel resizing."""
+    source_height, source_width = source_shape
+    active_workers = min(3, max(1, workers))
+    source_plane_bytes = source_height * source_width
+    target_bytes = target_height * target_width * 3
+    horizontal_plane_bytes = (
+        target_width * source_height if target_width != source_width else 0
+    )
+
+    # The destination, each worker's Pillow result plus NumPy view, contiguous
+    # source planes, and Pillow's horizontal-pass buffers can briefly coexist.
+    estimate = 3 * target_bytes
+    estimate += active_workers * (
+        2 * source_plane_bytes + horizontal_plane_bytes
+    )
+    estimate *= ResizeSettings.MEMORY_SAFETY_NUMERATOR
+    estimate = (
+        estimate + ResizeSettings.MEMORY_SAFETY_DENOMINATOR - 1
+    ) // ResizeSettings.MEMORY_SAFETY_DENOMINATOR
+    return estimate + ResizeSettings.FIXED_MEMORY_ALLOWANCE_BYTES
+
+
+def _resize_parallel_worker_count(
+    image: np.ndarray,
+    target_width: int,
+    target_height: int,
+) -> int:
+    """Choose the exact channel-parallel path only when CPU and RAM allow."""
+    if (
+        image.dtype != np.uint8
+        or image.ndim != 3
+        or image.shape[2] != 3
+        or target_width <= 0
+        or target_height <= 0
+        or target_width * target_height < ResizeSettings.PARALLEL_MIN_OUTPUT_PIXELS
+    ):
+        return 0
+    workers = ResizeSettings.PARALLEL_WORKERS
+    # With only two workers, scheduling three channel jobs was slower than the
+    # established RGB resize in the representative size sweep.
+    if _available_cpu_count() < workers:
+        return 0
+    available = _available_physical_memory_bytes()
+    if available is None:
+        return 0
+    required = _resize_parallel_memory_bytes(
+        image.shape[:2],
+        target_width,
+        target_height,
+        workers,
+    )
+    if required > available * ResizeSettings.MAX_AVAILABLE_MEMORY_FRACTION:
+        return 0
+    if required + ResizeSettings.MEMORY_RESERVE_BYTES > available:
+        return 0
+    return workers
+
+
 def _resize_bgr(image: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
-    """Resize a BGR image with Pillow, preserving the requested exact size.
+    """Resize a BGR image with Pillow, preserving exact established pixels.
 
     Pillow labels three-channel arrays as RGB, but its resize filters operate
-    on every channel independently.  Keeping the channels in BGR order avoids
-    two full-image BGR/RGB reversal copies without changing any pixel values.
+    independently. Large resizes can therefore process the B, G, and R planes
+    concurrently without changing the result. The sequential path remains the
+    fallback when CPU or RAM is limited or worker threads are unavailable.
     """
     if image.shape[:2] == (target_height, target_width):
         return image.copy()
@@ -347,9 +484,20 @@ def _resize_bgr(image: np.ndarray, target_width: int, target_height: int) -> np.
         if source_width * source_height > target_width * target_height
         else Image.Resampling.BICUBIC
     )
-    bgr = Image.fromarray(np.ascontiguousarray(image))
-    resized_bgr = bgr.resize((target_width, target_height), resample=resample)
-    return np.asarray(resized_bgr)
+    source = np.ascontiguousarray(image)
+    workers = _resize_parallel_worker_count(source, target_width, target_height)
+    if workers:
+        try:
+            return _resize_bgr_channels_parallel(
+                source,
+                target_width,
+                target_height,
+                resample,
+                workers,
+            )
+        except (MemoryError, OSError, RuntimeError):
+            pass
+    return _resize_bgr_sequential(source, target_width, target_height, resample)
 
 
 def _warp_bgr_affine(
@@ -757,9 +905,9 @@ def _linux_cgroup_available_memory_bytes() -> int | None:
 def _available_physical_memory_bytes() -> int | None:
     """Return safely allocatable physical memory without optional packages.
 
-    Unknown platforms deliberately return ``None``. The accelerated FFT then
-    stays disabled rather than guessing and potentially forcing the operating
-    system to page hundreds of megabytes.
+    Unknown platforms deliberately return ``None``. Memory-intensive fast
+    paths then stay disabled rather than guessing and potentially forcing the
+    operating system to page hundreds of megabytes.
     """
     if sys.platform == "win32":
         class MemoryStatusEx(ctypes.Structure):
@@ -894,7 +1042,7 @@ def _phase_chunked_fft_memory_bytes(
     return estimate + PhaseCorrelationSettings.CHUNKED_FFT_FIXED_MEMORY_ALLOWANCE_BYTES
 
 
-def _phase_available_cpu_count() -> int:
+def _available_cpu_count() -> int:
     """Return logical CPUs available to this process, respecting affinity."""
     available = cpu_count() or 1
     affinity_count = 0
@@ -921,6 +1069,11 @@ def _phase_available_cpu_count() -> int:
     if affinity_count > 0:
         available = min(available, affinity_count)
     return max(1, available)
+
+
+def _phase_available_cpu_count() -> int:
+    """Retain the phase-specific seam used by its resource-policy tests."""
+    return _available_cpu_count()
 
 
 def _phase_chunked_fft_workers(
