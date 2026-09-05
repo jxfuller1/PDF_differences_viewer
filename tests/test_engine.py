@@ -606,6 +606,185 @@ def test_phase_spectra_fall_back_when_threads_are_unavailable(monkeypatch) -> No
     assert _phase_correlate(first, second) == expected
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("shape", [(17, 19), (32, 48), (73, 91)])
+def test_chunked_phase_transforms_are_exact(dtype, shape) -> None:
+    rng = np.random.default_rng(827)
+    source = rng.normal(size=shape).astype(dtype)
+    padded_shape = (
+        engine._optimal_dft_size(shape[0]),
+        engine._optimal_dft_size(shape[1]),
+    )
+    expected_spectrum = np.fft.rfft2(
+        source,
+        s=padded_shape,
+        axes=(-2, -1),
+    )
+
+    with engine.ThreadPoolExecutor(max_workers=4) as executor:
+        actual_spectrum = engine._phase_chunked_forward(
+            source,
+            padded_shape,
+            executor,
+        )
+    np.testing.assert_array_equal(actual_spectrum, expected_spectrum)
+
+    expected_correlation = np.fft.irfft2(
+        expected_spectrum,
+        s=padded_shape,
+        axes=(-2, -1),
+    )
+    with engine.ThreadPoolExecutor(max_workers=4) as executor:
+        actual_correlation = engine._phase_chunked_inverse(
+            actual_spectrum,
+            padded_shape,
+            executor,
+        )
+    np.testing.assert_array_equal(actual_correlation, expected_correlation)
+
+
+def test_chunked_phase_transform_accepts_noncontiguous_input() -> None:
+    rng = np.random.default_rng(857)
+    source = rng.normal(size=(91, 143)).astype(np.float32)[::2, ::3]
+    assert not source.flags.c_contiguous
+    padded_shape = (
+        engine._optimal_dft_size(source.shape[0]),
+        engine._optimal_dft_size(source.shape[1]),
+    )
+    expected = np.fft.rfft2(source, s=padded_shape, axes=(-2, -1))
+    with engine.ThreadPoolExecutor(max_workers=4) as executor:
+        actual = engine._phase_chunked_forward(source, padded_shape, executor)
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_chunked_phase_worker_policy_accounts_for_cores_and_memory(monkeypatch) -> None:
+    shape = (1200, 1600)
+    padded_shape = shape
+    monkeypatch.setattr(engine, "_phase_available_cpu_count", lambda: 32)
+    monkeypatch.setattr(engine, "_available_physical_memory_bytes", lambda: 1 << 50)
+
+    assert engine._phase_chunked_fft_workers(shape, padded_shape, np.dtype(np.float32)) == 8
+
+    monkeypatch.setattr(engine, "_phase_available_cpu_count", lambda: 1)
+    assert engine._phase_chunked_fft_workers(shape, padded_shape, np.dtype(np.float32)) == 0
+
+    monkeypatch.setattr(engine, "_phase_available_cpu_count", lambda: 4)
+    monkeypatch.setattr(engine, "_available_physical_memory_bytes", lambda: None)
+    assert engine._phase_chunked_fft_workers(shape, padded_shape, np.dtype(np.float32)) == 0
+
+    required = engine._phase_chunked_fft_memory_bytes(
+        shape,
+        padded_shape,
+        np.dtype(np.float32),
+        4,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_available_physical_memory_bytes",
+        lambda: required + engine.PhaseCorrelationSettings.CHUNKED_FFT_MEMORY_RESERVE_BYTES - 1,
+    )
+    assert engine._phase_chunked_fft_workers(shape, padded_shape, np.dtype(np.float32)) == 0
+
+
+def test_phase_cpu_count_honors_windows_process_affinity(monkeypatch) -> None:
+    class Kernel32:
+        @staticmethod
+        def GetProcessAffinityMask(_process, process_mask, system_mask) -> int:
+            process_mask._obj.value = 0b001011
+            system_mask._obj.value = 0b111111
+            return 1
+
+    class WindowsLibraries:
+        kernel32 = Kernel32()
+
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setattr(engine, "cpu_count", lambda: 8)
+    monkeypatch.setattr(engine.ctypes, "windll", WindowsLibraries(), raising=False)
+
+    assert engine._phase_available_cpu_count() == 3
+
+
+def test_chunked_phase_memory_estimate_accounts_for_numpy_fft_dtype() -> None:
+    shape = (1200, 1600)
+    float32_bytes = engine._phase_chunked_fft_memory_bytes(
+        shape,
+        shape,
+        np.dtype(np.float32),
+        4,
+    )
+    float64_bytes = engine._phase_chunked_fft_memory_bytes(
+        shape,
+        shape,
+        np.dtype(np.float64),
+        4,
+    )
+    assert float32_bytes > 0
+    assert float64_bytes >= float32_bytes
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_adaptive_chunked_phase_preserves_standard_result(monkeypatch, dtype) -> None:
+    rng = np.random.default_rng(829)
+    first = rng.normal(size=(193, 257)).astype(dtype)
+    second = np.roll(first, shift=(7, -11), axis=(0, 1))
+    monkeypatch.setattr(engine, "_available_physical_memory_bytes", lambda: 0)
+    expected = _phase_correlate(first, second)
+
+    called = False
+    chunked = engine._phase_correlate_chunked
+
+    def recording_chunked(*args, **kwargs):
+        nonlocal called
+        called = True
+        return chunked(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "_phase_correlate_chunked", recording_chunked)
+    monkeypatch.setattr(engine, "_phase_available_cpu_count", lambda: 4)
+    monkeypatch.setattr(engine, "_available_physical_memory_bytes", lambda: 1 << 50)
+    monkeypatch.setattr(engine.PhaseCorrelationSettings, "CHUNKED_FFT_MIN_PIXELS", 0)
+
+    assert _phase_correlate(first, second) == expected
+    assert called
+
+
+def test_chunked_phase_falls_back_after_resource_failure(monkeypatch) -> None:
+    rng = np.random.default_rng(839)
+    first = rng.normal(size=(179, 241)).astype(np.float32)
+    second = np.roll(first, shift=(-5, 8), axis=(0, 1))
+    monkeypatch.setattr(engine, "_available_physical_memory_bytes", lambda: 0)
+    expected = _phase_correlate(first, second)
+
+    def unavailable(*_args, **_kwargs):
+        raise MemoryError("simulated allocation race")
+
+    monkeypatch.setattr(engine, "_phase_correlate_chunked", unavailable)
+    monkeypatch.setattr(engine, "_phase_available_cpu_count", lambda: 4)
+    monkeypatch.setattr(engine, "_available_physical_memory_bytes", lambda: 1 << 50)
+    monkeypatch.setattr(engine.PhaseCorrelationSettings, "CHUNKED_FFT_MIN_PIXELS", 0)
+
+    assert _phase_correlate(first, second) == expected
+
+
+def test_chunked_phase_falls_back_when_executor_is_unavailable(monkeypatch) -> None:
+    rng = np.random.default_rng(853)
+    first = rng.normal(size=(181, 239)).astype(np.float32)
+    second = np.roll(first, shift=(6, -9), axis=(0, 1))
+    monkeypatch.setattr(engine, "_available_physical_memory_bytes", lambda: 0)
+    expected = _phase_correlate(first, second)
+
+    class UnavailableExecutor:
+        def __init__(self, **_kwargs) -> None:
+            raise RuntimeError("worker threads unavailable in frozen runtime")
+
+    monkeypatch.setattr(engine, "ThreadPoolExecutor", UnavailableExecutor)
+    monkeypatch.setattr(engine, "_phase_available_cpu_count", lambda: 4)
+    monkeypatch.setattr(engine, "_available_physical_memory_bytes", lambda: 1 << 50)
+    monkeypatch.setattr(engine.PhaseCorrelationSettings, "CHUNKED_FFT_MIN_PIXELS", 0)
+    monkeypatch.setattr(engine.PhaseCorrelationSettings, "PARALLEL_FORWARD_MIN_PIXELS", 0)
+
+    assert _phase_correlate(first, second) == expected
+
+
 def test_numpy_ecc_preprocessing_matches_opencv_gaussian() -> None:
     rng = np.random.default_rng(101)
     image = rng.random((53, 71), dtype=np.float32)
